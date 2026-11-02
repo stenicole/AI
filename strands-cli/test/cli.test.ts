@@ -1,3 +1,4 @@
+import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { readFileSync } from 'node:fs'
@@ -8,14 +9,16 @@ import { URL, fileURLToPath } from 'node:url'
 import { describe, expect, it, vi } from 'vitest'
 import { DEFAULT_HARNESS_AGENT_CONFIG, defineHarnessAgentConfig } from '@strands-agents/harness'
 import type { Agent } from '@strands-agents/sdk'
+import { AgentSkills, Skill } from '@strands-agents/sdk/vended-plugins/skills'
 
 import { main, runPlainChat, selectRunMode } from '../src/cli/run.js'
 import { agentConfig, parseArgs, shouldPersistModelChanges } from '../src/cli/arguments.js'
-import { invocationAgentForRun } from '../src/cli/invocation.js'
+import { invocationAgentForRun, withDiscoveredSkills } from '../src/cli/invocation.js'
 import * as mcp from '../src/tui/mcp.js'
 import * as mcpConfig from '../src/tui/mcp/config.js'
 import { resolveMcpConfig } from '../src/tui/workspace/trust.js'
 import { applyProviderEnvironmentValues, CliConfigStore } from '../src/tui/config.js'
+import { stringify } from 'smol-toml'
 
 describe('agentConfig', () => {
   it('preserves defaults when no flags are supplied', () => {
@@ -209,16 +212,48 @@ describe('agentConfig', () => {
     })
   })
 
+  it.each([
+    { flags: ['--model', 'bedrock/new'], keepsModule: false },
+    { flags: ['--set', 'model="bedrock/new"'], keepsModule: false },
+    { flags: ['--model', 'bedrock/saved'], keepsModule: false },
+    { flags: ['--effort', 'low'], keepsModule: true },
+    {
+      flags: ['--model', 'bedrock/new', '--set', 'modelModule.export="replacement"'],
+      keepsModule: true,
+    },
+    {
+      flags: [
+        '--set',
+        'model="bedrock/new"',
+        '--set',
+        'modelModule={"kind":"model","module":"./model.mjs","export":"replacement"}',
+      ],
+      keepsModule: true,
+    },
+  ])('only retains an intentional model module for $flags', ({ flags, keepsModule }) => {
+    const config = agentConfig(parseArgs(flags), {
+      ...DEFAULT_HARNESS_AGENT_CONFIG,
+      model: 'bedrock/saved',
+      modelModule: { kind: 'model', module: './model.mjs', export: 'model' },
+    })
+
+    if (keepsModule) {
+      expect(config.modelModule).toEqual({
+        kind: 'model',
+        module: './model.mjs',
+        export: flags.includes('--set') ? 'replacement' : 'model',
+      })
+    } else {
+      expect(config.modelModule).toBeNull()
+    }
+  })
+
   it('rejects malformed and unknown arbitrary config fields', () => {
     expect(() => agentConfig(parseArgs(['--set', 'missing']), DEFAULT_HARNESS_AGENT_CONFIG)).toThrow(
       '--set expects field=value'
     )
     expect(() => agentConfig(parseArgs(['--set', 'modle=openai/gpt-5-mini']), DEFAULT_HARNESS_AGENT_CONFIG)).toThrow(
       'unknown agent config field'
-    )
-    // A retired profile key is just another unknown field.
-    expect(() => agentConfig(parseArgs(['--set', 'thinking=high']), DEFAULT_HARNESS_AGENT_CONFIG)).toThrow(
-      '--set contains an unknown agent config field "thinking".'
     )
   })
 })
@@ -266,12 +301,6 @@ describe('parseArgs', () => {
   })
 })
 
-describe('retired flag spellings', () => {
-  it('rejects a retired flag as an unknown option', () => {
-    expect(() => parseArgs(['--thinking', 'low'])).toThrow(/unknown option '--thinking'/u)
-  })
-})
-
 describe('profile model persistence', () => {
   it.each([
     ['--model', ['--model', 'openai/gpt-5']],
@@ -315,7 +344,7 @@ describe('project invocation', () => {
       vi.stubEnv('ANTHROPIC_API_KEY', undefined)
       vi.stubEnv('GEMINI_API_KEY', undefined)
       vi.stubEnv('STRANDS_CLI_PROJECT_TOKEN', undefined)
-      const path = join(directory, 'config.json')
+      const path = join(directory, 'cli.toml')
       const config = await CliConfigStore.load(path)
       await config.saveSetup({
         providers: ['bedrock'],
@@ -367,6 +396,33 @@ describe('project invocation', () => {
       await rm(directory, { recursive: true, force: true })
     }
   })
+})
+
+describe('console and ACP skill discovery', () => {
+  it.each(['skills', 'plugins'] as const)('keeps a configured AgentSkills instance in %s', async (field) => {
+    const plugin = new AgentSkills({
+      skills: [new Skill({ name: 'review', description: 'Review', instructions: 'Review the code.' })],
+      stateKey: 'custom_skills',
+    })
+    const options = field === 'skills' ? { skills: plugin } : { skills: false as const, plugins: [plugin] }
+    for (const discovery of [false, true]) {
+      expect(await withDiscoveredSkills(options, discovery)).toBe(options)
+    }
+  })
+
+  it.each([false, true])(
+    'retains Skill objects and configured source precedence with discovery=%s',
+    async (discovery) => {
+      const skill = new Skill({ name: 'review', description: 'Review', instructions: 'Review the code.' })
+      const url = 'https://example.com/SKILL.md'
+      const options = await withDiscoveredSkills({ skills: [skill, './configured-skills', url] }, discovery)
+      const expected = [skill, join(process.cwd(), 'configured-skills'), url]
+      expect(options.skills).toEqual(discovery ? expect.arrayContaining(expected) : expected)
+      assert(Array.isArray(options.skills))
+      expect(options.skills.slice(-3)).toEqual(expected)
+      expect((await withDiscoveredSkills({ skills: false }, discovery)).skills).toBe(false)
+    }
+  )
 })
 
 describe('selectRunMode', () => {
@@ -552,28 +608,20 @@ describe('TUI startup', () => {
     'avoids React timing retention while preserving NODE_ENV=%s',
     async (environment) => {
       const directory = await mkdtemp(join(tmpdir(), 'strands-cli-production-'))
-      // `--experimental-loader` requires a file:// URL; a bare Windows path is rejected by the ESM loader.
-      const loader = new URL('./fixtures/strands-cli-routing-source-loader.mjs', import.meta.url).href
       const fixture = fileURLToPath(new URL('./fixtures/strands-cli-production-probe.mjs', import.meta.url))
-      await mkdir(join(directory, '.strands', 'cli'), { recursive: true })
-      await writeFile(
-        join(directory, '.strands', 'cli', 'config.json'),
-        JSON.stringify({ settings: { animations: false } })
-      )
-      const child = spawn(
-        process.execPath,
-        ['--no-warnings=ExperimentalWarning', '--experimental-loader', loader, fixture],
-        {
-          cwd: directory,
-          env: {
-            PATH: process.env.PATH,
-            HOME: directory,
-            NODE_ENV: environment,
-            FORCE_COLOR: '1',
-          },
-          timeout: 10_000,
-        }
-      )
+      await mkdir(join(directory, '.strands'), { recursive: true })
+      await writeFile(join(directory, '.strands', 'cli.toml'), stringify({ settings: { animations: false } }))
+      const child = spawn(process.execPath, ['--import', import.meta.resolve('tsx/esm'), fixture], {
+        cwd: directory,
+        env: {
+          PATH: process.env.PATH,
+          HOME: directory,
+          NODE_ENV: environment,
+          FORCE_COLOR: '1',
+          TSX_TSCONFIG_PATH: fileURLToPath(new URL('../tsconfig.json', import.meta.url)),
+        },
+        timeout: 30_000,
+      })
       let stderr = ''
       child.stderr.on('data', (chunk: Buffer) => {
         stderr += chunk.toString()
@@ -581,12 +629,13 @@ describe('TUI startup', () => {
       try {
         const [code] = await once(child, 'close')
         expect(code, stderr).toBe(0)
+        expect(stderr).toContain('Startup assertions passed')
       } finally {
         child.kill()
         await rm(directory, { recursive: true, force: true })
       }
     },
-    15_000
+    35_000
   )
 })
 
@@ -613,15 +662,12 @@ describe('ACP mode routing', () => {
   })
 
   it('answers initialize while the ACP stdin protocol stream remains open', async () => {
-    // `--experimental-loader` requires a file:// URL; a bare Windows path is rejected by the ESM loader.
-    const loader = new URL('./fixtures/strands-cli-routing-source-loader.mjs', import.meta.url).href
     const entrypoint = fileURLToPath(new URL('../src/main.ts', import.meta.url))
     const cwd = fileURLToPath(new URL('..', import.meta.url))
-    const child = spawn(
-      process.execPath,
-      ['--no-warnings=ExperimentalWarning', '--experimental-loader', loader, entrypoint, '--acp-server'],
-      { cwd, stdio: ['pipe', 'pipe', 'pipe'] }
-    )
+    const child = spawn(process.execPath, ['--import', import.meta.resolve('tsx/esm'), entrypoint, '--acp-server'], {
+      cwd,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
     child.stdout.setEncoding('utf8')
     child.stderr.setEncoding('utf8')
     const closed = once(child, 'close')

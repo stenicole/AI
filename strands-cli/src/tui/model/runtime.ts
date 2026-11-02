@@ -26,15 +26,14 @@ import {
   type EffortInput,
 } from './selection.js'
 
-interface AgentBuildRequest {
+/** @internal */
+export interface AgentBuildRequest {
   model: string
   thinking: EffortInput
   sessionId?: string | null
   sessionDir?: string
   preserveConversation: boolean
   preserveReasoning?: boolean
-  preserveSnapshot: boolean
-  backgroundTasksWaitForCompletion: boolean
 }
 
 type AgentModelFactory = (request: AgentBuildRequest, previousAgent: Agent) => Promise<Agent>
@@ -49,7 +48,6 @@ interface AgentModelRuntimeOptions {
   thinking?: EffortInput
   sessionId?: string
   sessionDir?: string
-  backgroundTasksWaitForCompletion?: boolean
   restartAgent?: AgentModelFactory
   newSessionId?: () => string
   onModelChange?: (change: { model: string; effort: ProfileEffort }) => Promise<void> | void
@@ -66,7 +64,6 @@ export class AgentModelRuntime {
   private _target: ModelTarget | undefined
   private _thinking: Exclude<EffortInput, undefined>
   private _appliedThinking: Exclude<EffortInput, undefined>
-  private _backgroundTasksWaitForCompletion: boolean | undefined
   private readonly _bedrockCatalogs = new Map<string | undefined, Promise<readonly SelectableModel[]>>()
   private readonly _providerCatalogs = new Map<ProviderId, Promise<readonly SelectableModel[]>>()
   private readonly _contextWindows = new Map<string, Promise<number | undefined>>()
@@ -87,7 +84,6 @@ export class AgentModelRuntime {
     this._sessionDirectory = options.sessionDir ?? './.agent/sessions'
     this._thinking = options.thinking === undefined ? 'auto' : options.thinking
     this._appliedThinking = this._thinking
-    this._backgroundTasksWaitForCompletion = options.backgroundTasksWaitForCompletion
     this._createBedrockClient = options.createBedrockClient ?? defaultBedrockClient
     this._discoverProviderModels = options.discoverProviderModels
     this._discoverContextWindow = options.discoverContextWindow
@@ -145,12 +141,8 @@ export class AgentModelRuntime {
     return (await pending) ?? fallback
   }
 
-  get backgroundTasksWaitForCompletion(): boolean | undefined {
-    return this._backgroundTasksWaitForCompletion
-  }
-
   async *stream(...args: Parameters<Agent['stream']>): ReturnType<Agent['stream']> {
-    await this._applyPendingEffort()
+    await this.prepareInvocation()
     return yield* this._agent.stream(...args)
   }
 
@@ -193,17 +185,7 @@ export class AgentModelRuntime {
   }
 
   changeMode(modelId: string): 'live' | 'restart' {
-    const target = resolveModelTarget(modelId)
-    if (target.provider !== this.provider) {
-      return 'restart'
-    }
-    if (target.modelId === this.current) {
-      return 'live'
-    }
-    if (this.provider === 'bedrock' && bedrockLiveSwitchKey(target.modelId) === bedrockLiveSwitchKey(this.current)) {
-      return 'live'
-    }
-    return 'restart'
+    return modelChangeMode(this.current, this.provider, modelId)
   }
 
   async switch(modelId: string): Promise<string> {
@@ -224,30 +206,30 @@ export class AgentModelRuntime {
     if (!this._restartAgent) {
       throw new Error('This runtime cannot rebuild the agent.')
     }
+    const request = await this.prepareRestart(modelId)
+    this._agent = await this._restartAgent(request, this._agent)
+    this._thinking = request.thinking === undefined ? 'auto' : request.thinking
+    this._appliedThinking = this._thinking
+    this._target = resolveModelTarget(request.model)
+    await this._notifyModelChange()
+    return this.current
+  }
+
+  async prepareRestart(modelId: string): Promise<AgentBuildRequest> {
     const target = resolveModelTarget(modelId)
     if (!this._isActive(modelId)) {
       await validateModelSelection(modelId, this._discoverProviderModels, this._providerEnvironment)
     }
     const thinking = effortForModel(target.specifier, this._thinking)
     const currentModelId = this._target?.modelId ?? this.current
-    this._agent = await this._restartAgent(
-      {
-        model: target.specifier,
-        thinking,
-        ...(this._sessionId ? { sessionId: this._sessionId } : {}),
-        sessionDir: this._sessionDirectory,
-        preserveConversation: true,
-        preserveReasoning: reasoningProvider(currentModelId) === reasoningProvider(target.modelId),
-        preserveSnapshot: false,
-        backgroundTasksWaitForCompletion: this._backgroundTasksWaitForCompletion ?? false,
-      },
-      this._agent
-    )
-    this._thinking = thinking
-    this._appliedThinking = thinking
-    this._target = target
-    await this._notifyModelChange()
-    return this.current
+    return {
+      model: target.specifier,
+      thinking,
+      ...(this._sessionId ? { sessionId: this._sessionId } : {}),
+      sessionDir: this._sessionDirectory,
+      preserveConversation: true,
+      preserveReasoning: reasoningProvider(currentModelId) === reasoningProvider(target.modelId),
+    }
   }
 
   async setEffort(effort: string): Promise<string> {
@@ -276,8 +258,6 @@ export class AgentModelRuntime {
         sessionId: sessionId ?? null,
         sessionDir: this._sessionDirectory,
         preserveConversation: false,
-        preserveSnapshot: false,
-        backgroundTasksWaitForCompletion: this._backgroundTasksWaitForCompletion ?? false,
       },
       this._agent
     )
@@ -286,44 +266,14 @@ export class AgentModelRuntime {
     this._target = target
   }
 
-  async setBackgroundTasksWaitForCompletion(waitForCompletion: boolean): Promise<void> {
-    if (this._backgroundTasksWaitForCompletion === undefined) {
-      throw new Error('Background Tasks are disabled for this agent.')
-    }
-    if (!this._restartAgent) {
-      throw new Error('This runtime cannot rebuild the agent.')
-    }
-    if (this._backgroundTasksWaitForCompletion === waitForCompletion) {
-      return
-    }
-    const target = resolveModelTarget(this._target?.specifier ?? this.current)
-    this._agent = await this._restartAgent(
-      {
-        model: target.specifier,
-        thinking: this._thinking,
-        ...(this._sessionId ? { sessionId: this._sessionId } : {}),
-        sessionDir: this._sessionDirectory,
-        preserveConversation: false,
-        preserveSnapshot: true,
-        backgroundTasksWaitForCompletion: waitForCompletion,
-      },
-      this._agent
-    )
-    this._appliedThinking = this._thinking
-    this._backgroundTasksWaitForCompletion = waitForCompletion
-    this._target = target
-  }
-
   forkConfiguration(): {
     model: string
     thinking: Exclude<EffortInput, undefined>
-    backgroundTasksWaitForCompletion: boolean
   } {
     const target = resolveModelTarget(this._target?.specifier ?? this.current)
     return {
       model: target.specifier,
       thinking: this._thinking,
-      backgroundTasksWaitForCompletion: this._backgroundTasksWaitForCompletion ?? false,
     }
   }
 
@@ -334,7 +284,7 @@ export class AgentModelRuntime {
     })
   }
 
-  private async _applyPendingEffort(): Promise<void> {
+  async prepareInvocation(): Promise<void> {
     if (effortValue(this._appliedThinking) === effortValue(this._thinking)) {
       return
     }
@@ -349,8 +299,6 @@ export class AgentModelRuntime {
         ...(this._sessionId ? { sessionId: this._sessionId } : {}),
         sessionDir: this._sessionDirectory,
         preserveConversation: true,
-        preserveSnapshot: false,
-        backgroundTasksWaitForCompletion: this._backgroundTasksWaitForCompletion ?? false,
       },
       this._agent
     )
@@ -424,6 +372,17 @@ export class AgentModelRuntime {
     const modelId = this._target?.modelId ?? this.current
     return target.provider === provider && target.modelId === modelId
   }
+}
+
+/** @internal */
+export function modelChangeMode(current: string, provider: string, modelId: string): 'live' | 'restart' {
+  const target = resolveModelTarget(modelId)
+  if (target.provider !== provider) return 'restart'
+  if (target.modelId === current) return 'live'
+  if (provider === 'bedrock' && bedrockLiveSwitchKey(target.modelId) === bedrockLiveSwitchKey(current)) {
+    return 'live'
+  }
+  return 'restart'
 }
 
 function modelProvider(model: Model): string {

@@ -22,11 +22,13 @@ from uuid import uuid4
 import strands_harness
 from strands import Agent, tool
 from strands.hooks import HookOrder
-from strands.hooks.events import BeforeToolCallEvent
+from strands.hooks.events import BeforeModelCallEvent, BeforeToolCallEvent
+from strands.models import Model
 from strands.session import SnapshotSessionManager
 from strands.storage import LocalFileStorage
 from strands.tools.mcp import MCPClient
 from strands.types.tools import ToolContext
+from strands.vended_memory_stores.file_memory_store import FileMemoryStore
 from strands.vended_plugins.context_offloader import ContextOffloader
 from strands.vended_plugins.skills import AgentSkills
 from strands_harness import define_harness_agent_config, harness_agent_kwargs_from_config
@@ -35,6 +37,7 @@ from strands_harness.defaults import DEFAULT_MODEL
 channel = os.fdopen(3, "w", buffering=1)
 pending_permissions = {}
 COMPACT_PRESERVE_RECENT_MESSAGES = 2
+MAX_SAFE_INTEGER = 9_007_199_254_740_991
 
 
 def encode(value):
@@ -63,6 +66,68 @@ def compacted_tokens(reported, estimated_before, estimated_after):
     if reported is None or estimated_before is None or estimated_after is None:
         return estimated_after
     return max(0, reported - max(0, estimated_before - estimated_after))
+
+
+async def estimate_context_categories(context):
+    system = context.system_prompt
+    estimates = {
+        "systemPrompt": await Model.count_tokens(
+            context.model,
+            [],
+            system_prompt=system if isinstance(system, str) else None,
+            system_prompt_content=system if isinstance(system, list) else None,
+        ),
+        "tools": await Model.count_tokens(context.model, [], tool_specs=context.tool_specs),
+    }
+    grouped = {kind: [] for kind in ("userMessages", "assistantMessages", "toolResults", "injectedContext")}
+    last_user = next(
+        (index for index in range(len(context.messages) - 1, -1, -1) if context.messages[index]["role"] == "user"),
+        -1,
+    )
+    trailing = max(0, getattr(context, "dynamic_trailing_blocks", 0))
+    for index, message in enumerate(context.messages):
+        content = message["content"]
+        for block_index, block in enumerate(content):
+            if index == last_user and block_index >= len(content) - trailing:
+                kind = "injectedContext"
+            elif "toolResult" in block:
+                kind = "toolResults"
+            else:
+                kind = "assistantMessages" if message["role"] == "assistant" else "userMessages"
+            grouped[kind].append({"role": message["role"], "content": [block]})
+    for kind, messages in grouped.items():
+        estimates[kind] = await Model.count_tokens(context.model, messages)
+    return estimates
+
+
+def context_breakdown(estimates, current_tokens, projected_tokens):
+    if estimates is None or any(
+        type(value) is not int or value < 0 or value > MAX_SAFE_INTEGER
+        for value in (current_tokens, projected_tokens, *estimates.values())
+    ):
+        return None
+    if projected_tokens < current_tokens:
+        return None
+    total = sum(estimates.values())
+    tokens = {
+        kind: value * current_tokens // total if total > current_tokens else value
+        for kind, value in estimates.items()
+    }
+    tokens["other"] = current_tokens - sum(tokens.values())
+    tokens["assistantMessages"] += projected_tokens - current_tokens
+    return {"categories": [{"kind": kind, "tokens": value} for kind, value in tokens.items() if value > 0]}
+
+
+def context_model_usage(usage):
+    if not isinstance(usage, dict) or any(key not in usage for key in ("inputTokens", "outputTokens", "totalTokens")):
+        return None
+    numeric = {
+        key: usage.get(key, 0)
+        for key in ("inputTokens", "outputTokens", "totalTokens", "cacheReadInputTokens", "cacheWriteInputTokens")
+    }
+    if any(type(value) is not int or value < 0 or value > MAX_SAFE_INTEGER for value in numeric.values()):
+        return None
+    return numeric if any(numeric.values()) else None
 
 
 async def authorize_tool(event):
@@ -188,8 +253,12 @@ def agent_stash(agent):
 
 def local_stash_directory(agent):
     stash = agent_stash(agent)
-    base_directory = local_session_directory(getattr(stash, "_base_storage", None))
-    namespace = getattr(getattr(stash, "_storage", None), "_prefix", "")
+    base_storage = getattr(stash, "_base_storage", None)
+    storage = getattr(stash, "_storage", None)
+    base_directory = local_session_directory(base_storage)
+    if storage is base_storage:
+        return base_directory
+    namespace = getattr(storage, "_prefix", "")
     if base_directory is None or not namespace:
         return None
     # The namespace's first segment holds every session's stash, not just this agent's.
@@ -203,6 +272,16 @@ def local_offloader_directories(agent):
         for plugin in plugins
         if isinstance(plugin, ContextOffloader)
         and (directory := local_session_directory(getattr(plugin, "_storage", None)))
+    ]
+
+
+def local_memory_directories(agent):
+    # The SDK exposes local store paths only through the manager/store internals.
+    stores = getattr(getattr(agent, "memory_manager", None), "_stores", [])
+    return [
+        directory
+        for store in stores
+        if isinstance(store, FileMemoryStore) and (directory := local_session_directory(store._storage))
     ]
 
 
@@ -230,13 +309,15 @@ class Runtime:
                     target = target[key]
                 target[keys[-1]] = value
         self.options = overrides_from_config(partial)
-        for source, target in (("sessionId", "session_id"), ("sessionDir", "session_dir")):
-            if source in command:
-                self.options[target] = command[source]
         self.explicit_option_keys = set(self.options)
-        model = self.options.get("model")
+        authored = getattr(module, "_strands_options", {})
+        model = self.options.get("model", authored.get("model"))
+        if model is None and hasattr(module, "_strands_options"):
+            model = DEFAULT_MODEL
         self.source_configuration = (
-            {"model": model, "thinking": self.options.get("effort", "auto")} if isinstance(model, str) else None
+            {"model": model, "thinking": self.options.get("effort", authored.get("effort", "auto"))}
+            if isinstance(model, str)
+            else None
         )
         selection = command.get("sourceSelection")
         if (
@@ -245,21 +326,38 @@ class Runtime:
             and selection["source"] == module.__file__
             and selection["configured"] == self.source_configuration
         ):
-            self.options.update(
-                model=selection["selected"]["model"],
-                effort=selection["selected"]["thinking"],
-            )
+            for field, option in (("model", "model"), ("thinking", "effort")):
+                if selection["selected"][field] != self.source_configuration[field]:
+                    self.options[option] = selection["selected"][field]
+                    self.explicit_option_keys.add(option)
+        session = self.options.get("session", authored.get("session", True))
+        session_options = session if isinstance(session, dict) else {}
         self.session_configuration = {
-            "sessionId": self.options.get("session_id"),
-            "sessionDir": str(self.options.get("session_dir", ".agent/sessions")),
+            "sessionId": session_options.get("id"),
+            "sessionDir": str(session_options.get("dir", ".agent/sessions")),
         }
-        session_directory = command.get("sessionStorageDirectory")
-        self.options["session_dir"] = str(Path(self.options.get("session_dir", ".agent/sessions")).resolve())
-        self.session_directory = (
-            str(Path(session_directory).resolve())
-            if session_directory is not None
-            else str(Path(self.options["session_dir"]) / "session")
-        )
+        restoration = command.get("restoreSession")
+        if restoration and (session is True or isinstance(session, dict)):
+            identity = restoration["identity"]
+            if restoration["preserve"] or identity["configured"] == self.session_configuration:
+                session_options = {
+                    "id": identity["sessionId"],
+                    "dir": str(Path(identity["sessionDirectory"]).parent),
+                }
+                self.options["session"] = session_options
+                self.explicit_option_keys.add("session")
+        if "sessionId" in command and (session is True or isinstance(session, dict)):
+            self.options["session"] = {
+                **session_options,
+                "id": command["sessionId"],
+                **(
+                    {"dir": str(Path(command["sessionStorageDirectory"]).parent)}
+                    if "sessionStorageDirectory" in command
+                    else {}
+                ),
+                **({"dir": str(Path(command["sessionDir"]).parent)} if "sessionDir" in command else {}),
+            }
+            self.explicit_option_keys.add("session")
         self.agent: Agent
         self.initial_agent = module.agent
         self.factory = getattr(module, "create_agent", None)
@@ -268,26 +366,35 @@ class Runtime:
         self.skill_paths = command.get("skillPaths", [])
         self.cancel_signal = threading.Event()
         self.reload_requested = False
+        self.context_estimates = None
+        self.context_usage = None
 
-    async def build(self, options, snapshot=None):
+    async def build(self, options, snapshot=None, *, resume=False):
         previous = getattr(self, "agent", self.initial_agent)
         factory_options = {key: options[key] for key in self.explicit_option_keys if key in options}
         if self.initial_agent is not None and not factory_options:
             candidate = self.initial_agent
             self.initial_agent = None
         else:
-            self.initial_agent = None
             if not callable(self.factory):
                 raise ValueError(
                     "This source exports an agent instance but not create_agent(**overrides), "
                     "and is not a direct agent = create_harness(...) definition; recreation controls are unavailable."
                 )
+            manager = getattr(previous, "memory_manager", None)
+            if manager:
+                await manager.flush()
+            self.initial_agent = None
             candidate = self.factory(**factory_options)
         if inspect.isawaitable(candidate):
             candidate = await candidate
         if not isinstance(candidate, Agent):
             raise TypeError("create_harness() must return a Strands Agent")
         try:
+            if resume:
+                manager = candidate._session_manager
+                if not isinstance(manager, SnapshotSessionManager) or not await manager.restore_snapshot(candidate):
+                    raise ValueError("No saved Python session was found for this agent.")
             await self.augment(candidate)
             if snapshot:
                 candidate.load_snapshot(snapshot)
@@ -327,6 +434,59 @@ class Runtime:
                 await skills.init_agent(agent)
             else:
                 agent._plugin_registry.add_and_init(AgentSkills(skills=self.skill_paths))
+        self.attach_context_capture(agent)
+
+    def attach_context_capture(self, agent):
+        # Python exposes effective model requests only through the optional middleware registry.
+        try:
+            from strands.middleware import InvokeModelStage
+        except ImportError:
+            try:
+                from strands._middleware import InvokeModelStage
+            except ImportError:
+                return
+        registry = getattr(agent, "_middleware_registry", None)
+        add_middleware = getattr(registry, "add_middleware", None)
+        handlers_by_stage = getattr(registry, "_handlers", None)
+        if not callable(add_middleware) or not isinstance(handlers_by_stage, dict):
+            return
+        capture_ready = False
+
+        def prepare(event):
+            nonlocal capture_ready
+            if event.agent is not agent:
+                return
+            self.context_estimates = None
+            self.context_usage = None
+            capture_ready = False
+            handlers = handlers_by_stage.get(InvokeModelStage)
+            if not isinstance(handlers, list):
+                return
+            # Hooks can register request transforms, so observe after every other Wrap handler.
+            for index, handler in enumerate(handlers):
+                if getattr(handler, "handler", None) is capture:
+                    handlers.append(handlers.pop(index))
+                    capture_ready = True
+                    break
+
+        async def capture(context, next_handler):
+            estimates = None
+            if context.agent is agent:
+                self.context_estimates = None
+                self.context_usage = None
+                if capture_ready:
+                    with contextlib.suppress(Exception):
+                        handlers = handlers_by_stage.get(InvokeModelStage)
+                        if isinstance(handlers, list) and getattr(handlers[-1], "handler", None) is capture:
+                            estimates = await estimate_context_categories(context)
+            async for event in next_handler(context):
+                if context.agent is agent and "stop" in event:
+                    self.context_usage = context_model_usage(event["stop"][2])
+                    self.context_estimates = estimates if self.context_usage is not None else None
+                yield event
+
+        add_middleware(InvokeModelStage, capture)
+        agent.hooks.add_callback(BeforeModelCallEvent, prepare, order=HookOrder.SDK_LAST)
 
     def configuration_tool(self):
         runtime = self
@@ -354,7 +514,9 @@ class Runtime:
             if revision != 0:
                 raise ValueError("Inspect the source before applying it, then pass revision 0.")
             runtime.reload_requested = True
-            return "Source reload validated. It will be applied after this turn, preserving the conversation."
+            return (
+                "Source reload requested. Reload pending until this turn finishes; the conversation will be preserved."
+            )
 
         return strands_config
 
@@ -380,12 +542,16 @@ class Runtime:
 
     def state(self):
         model = self.options.get("model")
+        model_specifier = self.options.get(
+            "model", self.source_configuration["model"] if self.source_configuration else None
+        )
+        thinking = self.options.get(
+            "effort", self.source_configuration["thinking"] if self.source_configuration else "auto"
+        )
         if not isinstance(model, str):
             model = str(self.agent.model.get_config().get("model_id", type(self.agent.model).__name__))
         manager = self.agent._session_manager
-        session_id = (
-            manager.session_id if isinstance(manager, SnapshotSessionManager) else self.options.get("session_id")
-        )
+        session_id = manager.session_id if isinstance(manager, SnapshotSessionManager) else None
         storage = manager._storage if isinstance(manager, SnapshotSessionManager) else None
         session_directory = local_session_directory(storage)
         stash_directory = local_stash_directory(self.agent)
@@ -397,16 +563,16 @@ class Runtime:
             "reconstructable": callable(self.factory),
             "description": self.agent.description or "",
             "model": model,
-            **({"modelSpecifier": self.options["model"]} if isinstance(self.options.get("model"), str) else {}),
-            "thinking": self.options.get("effort", "auto"),
+            **({"modelSpecifier": model_specifier} if isinstance(model_specifier, str) else {}),
+            "thinking": thinking,
             **(
                 {
                     "sourceSelection": {
                         "source": self.module.__file__,
                         "configured": self.source_configuration,
                         "selected": {
-                            "model": self.options.get("model") or DEFAULT_MODEL,
-                            "thinking": self.options.get("effort", "auto"),
+                            "model": model_specifier,
+                            "thinking": thinking,
                         },
                     }
                 }
@@ -414,7 +580,7 @@ class Runtime:
                 else {}
             ),
             **({"sessionId": session_id} if session_id else {}),
-            "sessionDirectory": session_directory or self.options["session_dir"],
+            "sessionDirectory": session_directory or str(Path(self.session_configuration["sessionDir"]).resolve()),
             **(
                 {
                     "session": {
@@ -432,7 +598,7 @@ class Runtime:
                 *([session_directory] if session_directory else []),
                 *([stash_directory] if stash_directory else []),
                 *local_offloader_directories(self.agent),
-                str(Path(self.options.get("memory_dir", ".agent/memory")).resolve()),
+                *local_memory_directories(self.agent),
             ],
             "tools": [
                 {"name": spec["name"], "description": spec.get("description", "")}
@@ -493,6 +659,8 @@ class Runtime:
     async def turn(self, prompt):
         self.cancel_signal.clear()
         self.reload_requested = False
+        self.context_estimates = None
+        self.context_usage = None
         snapshot = self.agent.take_snapshot(preset="session")
         emitted_tool_results = set()
         try:
@@ -538,6 +706,16 @@ class Runtime:
                         "projectedTokens": result.projected_context_size,
                         "contextWindow": self.agent.model.context_window_limit,
                     }
+                    invocations = getattr(result.metrics, "agent_invocations", [])
+                    cycles = getattr(invocations[-1], "cycles", []) if invocations else []
+                    latest_usage = context_model_usage(getattr(cycles[-1], "usage", None)) if cycles else None
+                    breakdown = context_breakdown(
+                        self.context_estimates if self.context_usage == latest_usage else None,
+                        result.context_size,
+                        result.projected_context_size,
+                    )
+                    if breakdown is not None:
+                        context["breakdown"] = breakdown
                     self.result(
                         {
                             "stopReason": result.stop_reason,
@@ -606,6 +784,9 @@ class Runtime:
                 await self.save()
                 self.result({"stopReason": "restored"})
             else:
+                manager = getattr(self.agent, "memory_manager", None)
+                if manager:
+                    await manager.flush()
                 snapshot = self.agent.take_snapshot(include=["messages", "state", "conversation_manager_state"])
                 self.result(
                     {
@@ -666,9 +847,10 @@ class Runtime:
             if "thinking" in command:
                 options["effort"] = command["thinking"]
                 self.explicit_option_keys.add("effort")
-            if "sessionId" in command and options.get("session", True):
-                options["session_id"] = command["sessionId"]
-                self.explicit_option_keys.add("session_id")
+            session = options.get("session", getattr(self.module, "_strands_options", {}).get("session", True))
+            if "sessionId" in command and (session is True or isinstance(session, dict)):
+                options["session"] = {**(session if isinstance(session, dict) else {}), "id": command["sessionId"]}
+                self.explicit_option_keys.add("session")
             snapshot = None if command.get("clear") else self.agent.take_snapshot(preset="session")
             await self.build(options, snapshot)
             self.result({"stopReason": "reset"})
@@ -682,7 +864,7 @@ class Runtime:
             skills = self.skills()
             if not skills:
                 raise ValueError("This agent has no skills")
-            await skills.skills(
+            content = await skills.skills(
                 skill_name=command["name"],
                 tool_context=ToolContext(
                     tool_use={"toolUseId": str(uuid4()), "name": "skills", "input": {}},
@@ -691,7 +873,7 @@ class Runtime:
                 ),
             )
             await self.save()
-            self.result({"stopReason": "activated"})
+            self.result({"stopReason": "activated", "finalText": content})
         else:
             raise ValueError(f"Unknown terminal command: {kind}")
 
@@ -747,7 +929,8 @@ def load_project(entrypoint, root):
 
     def capture_create_harness(*args, **options):
         agent = original_create_harness(*args, **options)
-        captured.append((agent, args, options))
+        if captured is not None:
+            captured.append((agent, args, options))
         return agent
 
     strands_harness.create_harness = capture_create_harness
@@ -766,8 +949,11 @@ def load_project(entrypoint, root):
     agent = getattr(module, "agent", None)
     if not isinstance(agent, Agent):
         raise TypeError('Export a Strands Agent as "agent".')
+    construction = next(((args, options) for candidate, args, options in captured if candidate is agent), None)
+    captured = None
+    if construction is not None:
+        module._strands_options = construction[1]
     if not callable(getattr(module, "create_agent", None)) and direct_harness_assignment(entrypoint):
-        construction = next(((args, options) for candidate, args, options in captured if candidate is agent), None)
         if construction is not None:
             args, options = construction
 
@@ -782,7 +968,7 @@ async def main():
     module = load_project(Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve())
     command = json.loads(await asyncio.to_thread(sys.stdin.readline))
     runtime = Runtime(module, command)
-    await runtime.build(runtime.options)
+    await runtime.build(runtime.options, resume=command.get("resume", False))
     send({"type": "ready", "state": runtime.state()})
     running = None
     try:
@@ -808,6 +994,7 @@ async def main():
                     await runtime.command(command)
                 except Exception as error:
                     send({"type": "error", "message": str(error)})
+            del command, line
     finally:
         if running and not running.done():
             running.cancel()

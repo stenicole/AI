@@ -10,10 +10,12 @@ import { AgentSkills } from '@strands-agents/sdk/vended-plugins/skills'
 
 import { agentConfig, projectConfigOverrides, type ParsedArgs } from './arguments.js'
 import { restoreSessionAgentDefinition } from '../tui/session/agent-definition.js'
+import { withWorkspaceSessionDirectory } from '../tui/session/sessions.js'
 import { importAgentProject, type ImportedAgentProject } from '../tui/project/import.js'
 import type { AgentFactory } from '../tui/project/typescript.js'
 import { requireBedrockRegion } from '../tui/provider/aws-config.js'
 import type { ResolvedMcpConfig } from '../tui/workspace/trust.js'
+import { isRecord } from '../tui/values.js'
 
 interface InvocationAgent {
   profile?: HarnessAgentConfig
@@ -61,7 +63,7 @@ export async function invocationAgentForRun(
   config.applyProviderEnvironment()
   requireBedrockRegion(profile.model)
   const options = {
-    ...(await harnessAgentOptionsFromConfig(profile, baseDir)),
+    ...withWorkspaceSessionDirectory(await harnessAgentOptionsFromConfig(profile, baseDir), profile, cwd),
     printer: false,
   }
   return {
@@ -92,7 +94,7 @@ async function projectOverrides(
         const document = JSON.parse(await readFile(resolve(root, value), 'utf8'))
         value = document.mcpServers ?? document
       }
-      if (value && typeof value === 'object' && !Array.isArray(value)) {
+      if (isRecord(value)) {
         if (field === 'agentConfig') {
           base.agentConfig = { ...base.agentConfig, [option]: globalThis.structuredClone(value) }
         } else {
@@ -154,9 +156,10 @@ export async function withDiscoveredSkills(
   options: HarnessAgentOptions,
   discovery: boolean
 ): Promise<HarnessAgentOptions> {
-  const cwd = process.cwd()
-  const { resolveSkillPaths } = await import('../tui/skills.js')
-  const skills = options.skills instanceof AgentSkills ? undefined : options.skills
-  const skillPaths = resolveSkillPaths(skills, cwd, discovery)
-  return { ...options, skills: skillPaths.length > 0 ? skillPaths : false }
+  if (options.skills instanceof AgentSkills || options.plugins?.some((plugin) => plugin instanceof AgentSkills)) {
+    return options
+  }
+  const { resolveSkillSources } = await import('../tui/skills.js')
+  const sources = resolveSkillSources(options.skills, process.cwd(), discovery)
+  return { ...options, skills: sources.length > 0 ? sources : false }
 }

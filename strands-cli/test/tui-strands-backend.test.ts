@@ -5,15 +5,18 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   Agent,
   Message,
+  Model,
   TextBlock,
   ToolResultBlock,
   type AgentResult,
   type AgentStreamEvent,
+  type ModelStreamEvent,
 } from '@strands-agents/sdk'
 import { resolveModel } from '@strands-agents/harness/internal'
+import { BedrockModel } from '@strands-agents/sdk/models/bedrock'
 
 import { BackgroundAgentActivityStore } from '../src/tui/background/activity.js'
-import type { ChatEvent, ChatRunResult } from '../src/tui/chat/controller.js'
+import { ChatController, type ChatEvent, type ChatRunResult } from '../src/tui/chat/controller.js'
 import {
   SHELL_OUTPUT_HARD_LIMIT_BYTES,
   SHELL_OUTPUT_HARD_LIMIT_LABEL,
@@ -25,7 +28,7 @@ import { StrandsChatBackend } from '../src/tui/strands-backend.js'
 import { AgentModelRuntime } from '../src/tui/model/runtime.js'
 
 function withSnapshotMethods<T extends object>(agent: T): T {
-  return Object.assign(agent, {
+  return Object.assign({ tools: [] }, agent, {
     addHook: () => {},
     takeSnapshot: () => ({}),
     loadSnapshot: () => {},
@@ -44,7 +47,70 @@ async function collectStream(
   return { events, result: next.value }
 }
 
+class SessionNameModel extends Model {
+  calls = 0
+
+  constructor(private readonly response: string) {
+    super()
+  }
+
+  getConfig() {
+    return { modelId: 'session-name-test', contextWindowLimit: 10_000 }
+  }
+
+  updateConfig() {}
+
+  async *stream(): AsyncIterable<ModelStreamEvent> {
+    this.calls++
+    yield { type: 'modelMessageStartEvent', role: 'assistant' }
+    yield { type: 'modelContentBlockStartEvent' }
+    yield { type: 'modelContentBlockDeltaEvent', delta: { type: 'textDelta', text: this.response } }
+    yield { type: 'modelContentBlockStopEvent' }
+    yield { type: 'modelMessageStopEvent', stopReason: 'endTurn' }
+  }
+}
+
 describe('StrandsChatBackend', () => {
+  it('surfaces rejected AWS credentials through the SDK stream and returns the composer to idle', async () => {
+    vi.stubEnv('AWS_BEARER_TOKEN_BEDROCK', undefined)
+    const model = new BedrockModel({
+      region: 'us-east-1',
+      modelId: 'anthropic.claude-3-haiku-20240307-v1:0',
+      clientConfig: {
+        endpoint: 'http://127.0.0.1:1',
+        maxAttempts: 1,
+        credentials: async () => {
+          throw Object.assign(new Error('The security token included in the request is expired'), {
+            name: 'ExpiredTokenException',
+          })
+        },
+      },
+    })
+    const agent = new Agent({ model, printer: false, contextManager: false })
+    const controller = new ChatController(new StrandsChatBackend(new AgentModelRuntime(agent)), {
+      streamPresentation: {},
+    })
+    try {
+      await controller.submit('hello')
+      expect(controller.getSnapshot()).toMatchObject({
+        status: 'idle',
+        completedTurns: [
+          {
+            status: 'error',
+            error: expect.stringContaining('security token included in the request is expired'),
+            recoveryHint: 'Refresh your credentials, then resend your message.',
+          },
+        ],
+      })
+      expect(controller.getSnapshot().activeTurn).toBeUndefined()
+      expect(controller.busy).toBe(false)
+      expect(agent.messages).toHaveLength(0)
+    } finally {
+      await controller.dispose()
+      vi.unstubAllEnvs()
+    }
+  })
+
   it('displays Auto for a model without effort controls even with thinking disabled', async () => {
     const modelId = 'ollama/qwen3:8b'
     const model = await resolveModel(modelId, modelId, 'off')
@@ -82,11 +148,38 @@ describe('StrandsChatBackend', () => {
     await expect(backend.restartModel('openai/other-model')).rejects.toThrow('cannot rebuild')
     await expect(backend.setEffort('unsupported')).rejects.toThrow('is not supported')
     await expect(backend.clear()).rejects.toThrow('cannot rebuild')
-    await expect(backend.setBackgroundTasksWaitForCompletion(true)).rejects.toThrow('Background Tasks are disabled')
-    expect(backend.backgroundTasksWaitForCompletion()).toBeUndefined()
     const fork = backend.forkState()
     expect(fork.messages).toEqual(agent.messages)
     expect(fork.messages[0]).not.toBe(agent.messages[0])
+  })
+
+  it('generates an isolated three-word session name with the auxiliary model', async () => {
+    const mainModel = new SessionNameModel('Wrong Main Answer')
+    const auxiliaryModel = new SessionNameModel('Generated Session Name')
+    const agent = new Agent({
+      model: mainModel,
+      messages: [new Message({ role: 'user', content: [new TextBlock('Improve session browsing.')] })],
+      printer: false,
+    })
+    Object.assign(agent, { auxModel: auxiliaryModel })
+    const before = JSON.stringify(agent.messages)
+    const backend = new StrandsChatBackend(new AgentModelRuntime(agent))
+
+    await expect(backend.generateSessionName(new AbortController().signal)).resolves.toBe('Generated Session Name')
+    expect(auxiliaryModel.calls).toBe(1)
+    expect(mainModel.calls).toBe(0)
+    expect(JSON.stringify(agent.messages)).toBe(before)
+  })
+
+  it('rejects an invalid generated session name', async () => {
+    const agent = new Agent({
+      model: new SessionNameModel('This has four words'),
+      messages: [new Message({ role: 'user', content: [new TextBlock('Improve session browsing.')] })],
+      printer: false,
+    })
+    const backend = new StrandsChatBackend(new AgentModelRuntime(agent))
+
+    await expect(backend.generateSessionName(new AbortController().signal)).rejects.toThrow('three-word name')
   })
 
   it('hands a fork the context manager stash so it can retrieve content offloaded before the fork', async () => {
@@ -112,6 +205,25 @@ describe('StrandsChatBackend', () => {
     const backend = new StrandsChatBackend(new AgentModelRuntime(agent, { sessionId: 'session-1' }))
 
     await expect(backend.forkStash()).resolves.toBeUndefined()
+  })
+
+  it('flushes memory before capturing a handoff and leaves the conversation intact if flushing fails', async () => {
+    const agent = new Agent({ model: new SessionNameModel('Reply'), printer: false, contextManager: false })
+    await agent.initialize()
+    agent.messages.push(new Message({ role: 'user', content: [new TextBlock('Keep this conversation.')] }))
+    const messages = agent.messages
+    const flush = vi.fn().mockRejectedValueOnce(new Error('Memory unavailable')).mockResolvedValue(undefined)
+    Object.assign(agent, { memoryManager: { flush } })
+    const takeSnapshot = vi.spyOn(agent, 'takeSnapshot')
+    const backend = new StrandsChatBackend(new AgentModelRuntime(agent))
+
+    await expect(backend.captureConversation()).rejects.toThrow('Memory unavailable')
+    expect(takeSnapshot).not.toHaveBeenCalled()
+    expect(agent.messages).toBe(messages)
+    expect(agent.messages[0]?.content).toEqual([{ type: 'textBlock', text: 'Keep this conversation.' }])
+    await expect(backend.captureConversation()).resolves.toMatchObject({ scope: 'agent' })
+    expect(flush).toHaveBeenCalledTimes(2)
+    expect(takeSnapshot).toHaveBeenCalledWith({ include: ['messages', 'state'] })
   })
 
   it('rejects permission changes when no permission policy is configured', async () => {
@@ -467,38 +579,42 @@ describe('StrandsChatBackend', () => {
     }
   })
 
-  it('correlates durable tasks with observed subagent activity by tool-use ID', () => {
+  it('keeps activity until task delivery and preserves work awaiting its first task link', () => {
+    vi.useFakeTimers()
     const activity = new BackgroundAgentActivityStore()
-    activity.onStart({
-      name: 'subagent',
-      task: 'Review authentication.',
-      toolUseId: 'subagent-1',
-    })
+    activity.onStart({ name: 'subagent', task: 'Review authentication.', toolUseId: 'subagent-1' })
+    const tasks = [{ taskId: 'task-1', toolUseId: 'subagent-1', toolName: 'subagent', status: 'working' }]
     const agent = {
       cancel: () => {},
-      appState: {
-        get: () => [
-          {
-            taskId: 'task-1',
-            toolUseId: 'subagent-1',
-            toolName: 'subagent',
-            status: 'working',
-          },
-        ],
-      },
+      appState: { get: (key: string) => (key === 'strands.backgroundTasks' ? tasks : undefined) },
     } as unknown as Agent
     const backend = new StrandsChatBackend(new AgentModelRuntime(agent), { taskActivity: activity })
     const unwatch = backend.watchTasks(() => {})
+    try {
+      expect(backend.getTaskActivity('task-1')).toMatchObject({
+        taskId: 'task-1',
+        toolUseId: 'subagent-1',
+        name: 'subagent',
+        status: 'working',
+      })
+      activity.onComplete({ toolUseId: 'subagent-1' })
+      tasks[0]!.status = 'completed'
+      vi.advanceTimersByTime(200)
+      expect(backend.getTaskActivity('task-1')?.status).toBe('completed')
 
-    expect(backend.getTaskActivity('task-1')).toMatchObject({
-      taskId: 'task-1',
-      toolUseId: 'subagent-1',
-      name: 'subagent',
-      status: 'working',
-    })
+      activity.onStart({ name: 'subagent', task: 'Check tests.', toolUseId: 'subagent-2' })
+      tasks.length = 0
+      vi.advanceTimersByTime(200)
+      expect(backend.getTaskActivity('task-1')).toBeUndefined()
 
-    unwatch()
-    backend.dispose()
+      tasks.push({ taskId: 'task-2', toolUseId: 'subagent-2', toolName: 'subagent', status: 'working' })
+      vi.advanceTimersByTime(200)
+      expect(backend.getTaskActivity('task-2')?.task).toBe('Check tests.')
+    } finally {
+      unwatch()
+      void backend.dispose()
+      vi.useRealTimers()
+    }
   })
 
   it('publishes durable task results after the model turn has returned', () => {

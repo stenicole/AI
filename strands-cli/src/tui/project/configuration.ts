@@ -3,17 +3,20 @@ import { basename, isAbsolute, resolve } from 'node:path'
 import type { HarnessAgentConfig, HarnessModuleReference } from '@strands-agents/harness'
 import { normalizeHarnessAgentConfig } from '@strands-agents/harness/internal'
 
-import { mapWebFetchModelModule } from '../builtin-tools.js'
+import { mapWebFetchModelModule, webFetchModelModule } from '../builtin-tools.js'
 
 import { scanConfigSecrets } from './configuration-secrets.js'
 import type { AgentProjectLanguage } from './import.js'
-import { containsPath, packageName, packageSources, realSource, sourceBase, type PackagedSource } from './packaging.js'
+import { containsPath } from '../paths.js'
+import { packageName, packageSources, realSource, sourceBase, type PackagedSource } from './packaging.js'
 import { validatePortableDependencies } from './portable-dependencies.js'
 import { packageMcpServers } from './portable-mcp.js'
+import { isRecord } from '../values.js'
 
 function configurationModules(config: HarnessAgentConfig): (HarnessModuleReference | null)[] {
   return [
     config.modelModule,
+    webFetchModelModule(config.builtinTools),
     ...config.tools,
     ...config.subagents,
     ...config.plugins,
@@ -27,7 +30,7 @@ function configurationModules(config: HarnessAgentConfig): (HarnessModuleReferen
 export function portableConfig(
   profile: HarnessAgentConfig,
   language: AgentProjectLanguage,
-  hasSkills: boolean,
+  skillSources: readonly string[],
   sources: PackagedSource[],
   baseDir = process.cwd()
 ): HarnessAgentConfig {
@@ -99,7 +102,7 @@ export function portableConfig(
     agentConfigModules: Object.fromEntries(
       Object.entries(config.agentConfigModules).map(([key, value]) => [key, reference(value)])
     ),
-    skills: hasSkills ? ['./agent/skills'] : false,
+    skills: skillSources.length > 0 ? [...skillSources] : false,
     session: config.session === true ? { dir: './.agent/sessions' } : config.session,
     memory: config.memory === true ? { dir: './.agent/memory' } : config.memory,
   }
@@ -161,10 +164,10 @@ function portableMcpServers(value: HarnessAgentConfig['mcpServers'], baseDir = p
   } catch (error) {
     throw new Error(`MCP config ${JSON.stringify(value)} must be valid JSON.`, { cause: error })
   }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+  if (!isRecord(parsed)) {
     throw new Error(`MCP config ${JSON.stringify(value)} must contain a server map.`)
   }
-  return mcpServerMap(parsed as Record<string, unknown>)
+  return mcpServerMap(parsed)
 }
 
 function mcpServerMap(value: Record<string, unknown>): Record<string, unknown> {
@@ -172,14 +175,14 @@ function mcpServerMap(value: Record<string, unknown>): Record<string, unknown> {
   if (nested === undefined) {
     return value
   }
-  if (!nested || typeof nested !== 'object' || Array.isArray(nested)) {
+  if (!isRecord(nested)) {
     throw new Error('mcpServers must contain a server map.')
   }
-  return nested as Record<string, unknown>
+  return nested
 }
 
 function inferredLanguage(module: string): AgentProjectLanguage | undefined {
-  if (/\.(?:cjs|js|jsx|mjs|ts|tsx)$/iu.test(module)) {
+  if (/\.[cm]?[jt]sx?$/iu.test(module)) {
     return 'typescript'
   }
   return /\.py$/iu.test(module) ? 'python' : undefined
@@ -199,7 +202,7 @@ function requireDependency(
         : module.split('/')[0]!
       : module.split('.')[0]!)
   if (language === 'typescript') {
-    if (!config.dependencies.typescript[packageName]) {
+    if (!Object.hasOwn(config.dependencies.typescript, packageName) || !config.dependencies.typescript[packageName]) {
       throw new Error(
         `Module ${JSON.stringify(module)} requires dependencies.typescript[${JSON.stringify(packageName)}].`
       )
@@ -210,7 +213,7 @@ function requireDependency(
   const declared = config.dependencies.python.some(
     (dependency) =>
       dependency
-        .split(/(?:<|>|=|!|~|\[)/u, 1)[0]!
+        .split(/(?:<|>|=|!|~|\[|\(|;|@)/u, 1)[0]!
         .trim()
         .toLowerCase()
         .replace(/[-_.]+/gu, '-') === normalized
@@ -231,7 +234,7 @@ export function validateNoConfigSecrets(
 
 function validatePythonMcp(servers: Record<string, unknown>): void {
   for (const [name, raw] of Object.entries(servers)) {
-    if (raw && typeof raw === 'object' && !Array.isArray(raw) && 'tasksConfig' in raw) {
+    if (isRecord(raw) && 'tasksConfig' in raw) {
       throw new Error(`MCP server ${JSON.stringify(name)} uses tasksConfig, which the Python harness cannot reproduce.`)
     }
   }

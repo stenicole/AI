@@ -3,29 +3,33 @@ import { resolve } from 'node:path'
 import { createHarness, type HarnessAgentConfig, type HarnessAgentOptions } from '@strands-agents/harness'
 import { resolveInterventions } from '@strands-agents/harness/internal'
 import type { Message, Agent, Tool } from '@strands-agents/sdk'
+import { Offload } from '@strands-agents/sdk/experimental'
 import { ContextInjector } from '@strands-agents/sdk/vended-plugins'
 import { AgentSkills } from '@strands-agents/sdk/vended-plugins/skills'
 
 import { createBuiltinToolsRuntime, createConfigurationTool, type RequestSetup } from './agent-configuration.js'
+import { configurationSource } from './configuration-source.js'
 import { CONFIGURATION_INSTRUCTIONS } from './configuration-instructions.js'
-import { exportAgentProject, exportSourceProject } from './project/export.js'
+import { agentPrivatePaths, exportAgentProject, exportSourceProject } from './project/export.js'
 import type { ImportedAgentProject } from './project/import.js'
 import type { AgentFactory } from './project/typescript.js'
 import { BackgroundAgentActivityStore, observeSubagentActivity } from './background/activity.js'
 import { BackgroundAgentInbox } from './background/inbox.js'
 import {
   ChatController,
+  type ChatConfigurationSource,
   type ChatConversation,
+  type ChatConversations,
   type ChatDiffPreview,
   type ChatForkState,
   type ChatSettings,
+  type ContextOffloadThreshold,
 } from './chat/controller.js'
 import { isUnresolvedBackgroundTask } from './chat/controller-helpers.js'
-import { ConversationManager } from './session/conversations.js'
-import { CliConfigStore } from './config.js'
-import { loadMcp, type LoadMcpOptions } from './mcp.js'
-import { memoryDirectory } from './memory-options.js'
-import { AgentMessaging, peerMessagePrompt } from './messaging.js'
+import { ConversationManager, type InitialConversations } from './session/conversations.js'
+import { CliConfigStore, type ProfileEffort, type RuntimeConfig } from './config.js'
+import { loadMcp, type LoadedMcp, type LoadMcpOptions } from './mcp.js'
+import { AgentMessaging, peerMessagePrompt, type PeerMessageRouter } from './messaging.js'
 import { AgentModelRuntime } from './model/runtime.js'
 import { profileEffort } from './model/selection.js'
 import { sessionSettings, withSession } from './session/options.js'
@@ -41,10 +45,11 @@ import {
   restoreSessionAgentDefinition,
 } from './session/agent-definition.js'
 import { DEFAULT_SESSION_DIR, FileSessionRuntime, SessionRootCatalog, type SessionTarget } from './session/sessions.js'
-import { configuredSkillPaths, FileSkillsRuntime, resolveSkillPaths, type SkillPathsOption } from './skills.js'
+import { AgentSkillsRuntime, resolveSkillPaths, resolveSkillSources } from './skills.js'
 import { StrandsChatBackend } from './strands-backend.js'
 import { LiveSteering } from './steering.js'
 import { DEFAULT_STREAM_PRESENTATION } from './stream-presentation.js'
+import { graphemes } from './terminal/composer.js'
 import { errorMessage } from './terminal/sanitize.js'
 import { PythonVoiceSession } from './voice/session.js'
 import { inspectWorkspaceMcp, isWorkspaceMcpTrusted } from './workspace/trust.js'
@@ -62,45 +67,78 @@ interface CreateInteractiveChatOptions {
   mcpDigests?: Readonly<Record<string, string>>
   configPath?: string
   config?: CliConfigStore
-  sessionCatalogPath?: string
+  /** Directory holding the built-in agent's per-workspace session directories; defaults to `~/.strands/sessions`. */
+  sessionRoot?: string
   requestSetup?: RequestSetup
-  conversation?: ChatConversation
 }
 
-interface ControllerRequest {
+/** @internal */
+export interface CreateInteractiveRuntimeOptions extends Omit<
+  CreateInteractiveChatOptions,
+  'config' | 'configPath' | 'persistModelChanges' | 'requestSetup'
+> {
+  config: RuntimeConfig
+  agentMessaging?: AgentMessaging
+  peerMessageRouter?: PeerMessageRouter
+  configurationEnabled?: boolean
+  allowRebuild?: boolean
+  onModelChange?: (change: { model: string; effort: ProfileEffort }) => Promise<void> | void
+}
+
+/** @internal */
+export interface RuntimeBackendRequest {
   workspace: string
   sessionDirectory: string
   sessionId?: string
   sessionManager?: HarnessAgentOptions['sessionManager']
   seed?: ChatForkState
   restoreSeedMessages?: boolean
-  settings?: Partial<ChatSettings>
-  conversation?: ChatConversation
+  peerEndpointId: string
+  selection?: ChatConversation['selection']
+  onConfigurationDiscard?: () => void
+  onDispose?: () => void
 }
 
-export async function createInteractiveChat(options: CreateInteractiveChatOptions = {}): Promise<ConversationManager> {
+interface ControllerRequest extends Omit<RuntimeBackendRequest, 'peerEndpointId'> {
+  peerEndpointId?: string
+  settings?: Partial<ChatSettings>
+}
+
+/** @internal */
+export interface InteractiveRuntimeBackend {
+  runtime: AgentModelRuntime
+  backend: StrandsChatBackend
+  mcp: LoadedMcp
+  skills: AgentSkillsRuntime
+  sessions: FileSessionRuntime
+  configuration?: ReturnType<typeof createConfigurationTool>
+  profile(): HarnessAgentConfig
+}
+
+/** @internal */
+export interface InteractiveRuntime {
+  createBackend(request: RuntimeBackendRequest, conversation?: ChatConversation): Promise<InteractiveRuntimeBackend>
+  dispose(): Promise<void>
+}
+
+/** @internal */
+export async function createInteractiveRuntime(options: CreateInteractiveRuntimeOptions): Promise<InteractiveRuntime> {
   const initialWorkspace = resolve(options.cwd ?? process.cwd())
   const configuredSessionSettings = sessionSettings(options.agentOptions?.session)
   const initialSessionDirectory = resolve(initialWorkspace, configuredSessionSettings.dir ?? DEFAULT_SESSION_DIR)
-  const sessionCatalog = await loadSessionCatalog(options.sessionCatalogPath)
-
-  const config = options.config ?? (await CliConfigStore.load(options.configPath))
+  const sessionCatalog = await loadSessionCatalog(options.sessionRoot)
+  const config = options.config
+  const launchSettings = config.snapshot().settings
   const configuredInterventions = await resolveInterventions(options.agentOptions?.interventions)
   const configuredSessionId = configuredSessionSettings.id
   const {
     interventions: _interventions,
     session: _session,
-    sessionManager: explicitSessionManager,
-    skills: configuredSkills,
+    sessionManager: _sessionManager,
     sandbox: configuredSandbox,
     mcpServers: configuredMcpServers,
     ...portableAgentOptions
   } = options.agentOptions ?? {}
-  // A `SessionManager` instance on `session` is honored like the SDK's `sessionManager`.
-  const configuredSessionManager = explicitSessionManager ?? configuredSessionSettings.manager
-  // TODO(skills): `FileSkillsRuntime` only honors string paths; an `AgentSkills` instance falls back to default discovery.
-  const configuredSkillSources: SkillPathsOption =
-    configuredSkills instanceof AgentSkills ? undefined : configuredSkills
   const sourceDefinition =
     options.project && typeof portableAgentOptions.model === 'string'
       ? {
@@ -111,26 +149,15 @@ export async function createInteractiveChat(options: CreateInteractiveChatOption
           },
         }
       : undefined
-  const sourceSelection = options.conversation?.sourceSelection
-  const selectedAgentOptions =
-    sourceDefinition &&
-    sourceSelection?.source === sourceDefinition.source &&
-    sourceSelection.configured.model === sourceDefinition.configured.model &&
-    sourceSelection.configured.thinking === sourceDefinition.configured.thinking
-      ? {
-          ...portableAgentOptions,
-          model: sourceSelection.selected.model,
-          effort: profileEffort(sourceSelection.selected.thinking),
-        }
-      : portableAgentOptions
-  const agentMessaging = new AgentMessaging()
+  const agentMessaging = options.agentMessaging ?? new AgentMessaging()
   const subagentToolsByAgent = new Map<Agent, Tool>()
   const stopObservingSubagents = new Map<Tool, () => void>()
   const agents = new Set<Agent>()
-  const controllerContexts = new WeakMap<ChatController, { workspace: string; sessionDirectory: string }>()
-  let nextPeerEndpoint = 1
+  const backends = new Set<StrandsChatBackend>()
+  const skillsByAgent = new WeakMap<Agent, AgentSkills>()
   let nextBackgroundEndpoint = 1
   let disposed = false
+  let disposal: Promise<void> | undefined
 
   const releaseAgent = (candidate: Agent): void => {
     agentMessaging.unbindAgent(candidate)
@@ -143,25 +170,46 @@ export async function createInteractiveChat(options: CreateInteractiveChatOption
     }
   }
 
+  const disposeFailedAgent = async (candidate: Agent): Promise<void> => {
+    candidate.cancel()
+    releaseAgent(candidate)
+    await Promise.allSettled([candidate.memoryManager?.flush()])
+  }
+
   const buildAgent = async (
     controllerOptions: HarnessAgentOptions,
     configuredTools: NonNullable<HarnessAgentOptions['tools']>,
     peerEndpointId: string,
     backgroundActivity: BackgroundAgentActivityStore,
     overrides: Partial<HarnessAgentOptions>,
-    waitForCompletion: boolean
+    workspace: string
   ): Promise<Agent> => {
     if (disposed) {
       throw new Error('Runtime is disposed.')
     }
     const agentOptions = { ...controllerOptions, ...overrides }
-    requireBedrockRegion(agentOptions.model)
-    const agent = await (options.buildAgent ?? createHarness)({
-      ...agentOptions,
+    const resolvedAgentOptions = options.project
+      ? agentOptions
+      : withContextOffloadThreshold(agentOptions, launchSettings.contextOffloadThreshold)
+    requireBedrockRegion(resolvedAgentOptions.model)
+    let skills: AgentSkills | undefined
+    const prepareOptions = (configured: HarnessAgentOptions): HarnessAgentOptions => {
+      skills = configured.plugins?.find((plugin): plugin is AgentSkills => plugin instanceof AgentSkills)
+      if (skills) return configured
+      if (configured.skills instanceof AgentSkills) {
+        skills = configured.skills
+      } else {
+        const sources = resolveSkillSources(configured.skills, workspace, config.snapshot().settings.skillDiscovery)
+        skills = sources.length > 0 ? new AgentSkills({ skills: sources }) : undefined
+      }
+      return { ...configured, skills: skills ?? false }
+    }
+    const configured: HarnessAgentOptions = {
+      ...resolvedAgentOptions,
       tools: [...configuredTools],
       plugins: [
         ...(agentOptions.plugins ?? []),
-        ...(options.requestSetup
+        ...(options.configurationEnabled
           ? [
               new ContextInjector({
                 name: 'strands:configuration-awareness',
@@ -171,47 +219,69 @@ export async function createInteractiveChat(options: CreateInteractiveChatOption
               }),
             ]
           : []),
-        ...(config.snapshot().settings.agentMessaging ? [agentMessaging.createPlugin(peerEndpointId)] : []),
+        ...(config.snapshot().settings.agentMessaging
+          ? [agentMessaging.createPlugin(peerEndpointId, options.peerMessageRouter)]
+          : []),
       ],
-      backgroundTasks: interactiveBackgroundTasks(agentOptions, waitForCompletion),
+      backgroundTasks: interactiveBackgroundTasks(agentOptions),
       printer: false,
-    }).catch(rethrowWithProviderHint)
-    await initializeAgentDefinition(agent)
-    agent.messages = upgradeDesktopAgentProfileMessages(agent.messages)
-    await persistSessionAgentDefinition(agentOptions)
-    if (disposed) {
-      agentMessaging.unbindAgent(agent)
-      throw new Error('Runtime was disposed while building an agent.')
     }
-    agents.add(agent)
-    const subagentTool = agent.toolRegistry.get('subagent')
-    if (subagentTool) {
-      subagentToolsByAgent.set(agent, subagentTool)
-      if (!stopObservingSubagents.has(subagentTool)) {
-        stopObservingSubagents.set(subagentTool, observeSubagentActivity(subagentTool, backgroundActivity))
+    const agent = await (
+      options.buildAgent ? options.buildAgent(configured, prepareOptions) : createHarness(prepareOptions(configured))
+    ).catch(rethrowWithProviderHint)
+    try {
+      if (disposed) throw new Error('Runtime was disposed while building an agent.')
+      await initializeAgentDefinition(agent)
+      agent.messages = upgradeDesktopAgentProfileMessages(agent.messages)
+      await persistSessionAgentDefinition(agentOptions)
+      if (disposed) throw new Error('Runtime was disposed while building an agent.')
+      agents.add(agent)
+      if (skills) skillsByAgent.set(agent, skills)
+      const subagentTool = agent.toolRegistry.get('subagent')
+      if (subagentTool) {
+        subagentToolsByAgent.set(agent, subagentTool)
+        if (!stopObservingSubagents.has(subagentTool)) {
+          stopObservingSubagents.set(subagentTool, observeSubagentActivity(subagentTool, backgroundActivity))
+        }
       }
+      return agent
+    } catch (error) {
+      await disposeFailedAgent(agent)
+      throw error
     }
-    return agent
   }
 
-  const disposeShared = async (): Promise<void> => {
-    if (disposed) {
-      return
-    }
+  const dispose = (): Promise<void> => {
+    if (disposal) return disposal
     disposed = true
-    // Extraction runs in the background on a turn interval; flush every live agent at teardown so a
-    // session that ends between intervals still persists its recent turns.
-    await Promise.allSettled([...agents].map((agent) => agent.memoryManager?.flush()))
-    for (const stop of stopObservingSubagents.values()) {
-      stop()
-    }
-    stopObservingSubagents.clear()
-    agents.clear()
-    subagentToolsByAgent.clear()
+    disposal = (async (): Promise<void> => {
+      await Promise.allSettled([...backends].map((backend) => backend.dispose()))
+      await Promise.allSettled([...agents].map((agent) => agent.memoryManager?.flush()))
+      for (const stop of stopObservingSubagents.values()) stop()
+      stopObservingSubagents.clear()
+      agents.clear()
+      subagentToolsByAgent.clear()
+    })()
+    return disposal
   }
 
-  const createController = async (request: ControllerRequest): Promise<ChatController> => {
-    const peerEndpointId = `agent-${nextPeerEndpoint++}`
+  const createBackend = async (
+    request: RuntimeBackendRequest,
+    conversation?: ChatConversation
+  ): Promise<InteractiveRuntimeBackend> => {
+    if (disposed) throw new Error('Runtime is disposed.')
+    const peerEndpointId = request.peerEndpointId
+    const sourceSelection = conversation?.sourceSelection
+    const selection =
+      sourceDefinition &&
+      sourceSelection?.source === sourceDefinition.source &&
+      sourceSelection.configured.model === sourceDefinition.configured.model &&
+      sourceSelection.configured.thinking === sourceDefinition.configured.thinking
+        ? sourceSelection.selected
+        : request.selection
+    const selectedAgentOptions = selection
+      ? { ...portableAgentOptions, model: selection.model, effort: profileEffort(selection.thinking) }
+      : portableAgentOptions
     const backgroundInbox = new BackgroundAgentInbox()
     const backgroundActivity = new BackgroundAgentActivityStore(backgroundInbox)
     const backgroundEndpointIds = new Map<string, string>()
@@ -230,7 +300,7 @@ export async function createInteractiveChat(options: CreateInteractiveChatOption
       const summary = endpoint.task.replace(/\s+/g, ' ').trim()
       agentMessaging.register({
         id: endpointId,
-        name: summary ? `${endpoint.name}: ${summary.slice(0, 80)}` : endpoint.name,
+        name: summary ? `${endpoint.name}: ${graphemes(summary).slice(0, 80).join('')}` : endpoint.name,
         status: () => 'working',
         enqueue: (message): boolean => backgroundInbox.send(endpoint.taskId, peerMessagePrompt(message)),
       })
@@ -243,7 +313,7 @@ export async function createInteractiveChat(options: CreateInteractiveChatOption
     const sessionId = sessionEnabled
       ? (request.sessionId ?? (request.sessionManager === undefined ? createInteractiveSessionId() : undefined))
       : undefined
-    await registerSessionRoot(sessionCatalog, sessionDirectory, workspace)
+    if (sessionEnabled) await registerSessionRoot(sessionCatalog, sessionDirectory, workspace)
 
     const baseAgentOptions: HarnessAgentOptions = sessionEnabled
       ? withSession(selectedAgentOptions, { id: sessionId, dir: sessionDirectory })
@@ -251,16 +321,21 @@ export async function createInteractiveChat(options: CreateInteractiveChatOption
     const restoredAgentOptions = options.project
       ? baseAgentOptions
       : await restoreSessionAgentDefinition(baseAgentOptions, workspace)
-    const skillPaths = resolveSkillPaths(configuredSkillSources, workspace, config.snapshot().settings.skillDiscovery)
-    const profileSkillPaths = configuredSkillPaths(configuredSkillSources, workspace)
     const sandbox =
       configuredSandbox === undefined || configuredSandbox === false
         ? new WorkspaceSandbox(workspace)
         : configuredSandbox
-    const mcp = await loadMcp({
+    const loadedMcp = await loadMcp({
       ...(await workspaceMcpOptions(options, initialWorkspace, workspace, config.snapshot().settings.mcpDiscovery)),
       ...(configuredMcpServers ? { servers: configuredMcpServers } : {}),
+      backgroundConnect: true,
+      disabledServers: config.snapshot().settings.disabledMcpServers,
     })
+    let mcpDisposal: Promise<void> | undefined
+    const mcp: LoadedMcp = {
+      ...loadedMcp,
+      dispose: (): Promise<void> => (mcpDisposal ??= loadedMcp.dispose()),
+    }
     const configuredTools: NonNullable<HarnessAgentOptions['tools']> = [
       ...(restoredAgentOptions.tools ?? []),
       ...mcp.clients,
@@ -271,6 +346,9 @@ export async function createInteractiveChat(options: CreateInteractiveChatOption
       config,
       cwd: workspace,
       configurationPreview: (): ChatDiffPreview | undefined => configuration?.preview(),
+      configurationDenied: (revision): void => {
+        if (configuration?.discard(revision)) request.onConfigurationDiscard?.()
+      },
     })
     const liveSteering: LiveSteering = new LiveSteering((candidate) => {
       return backgroundInbox.observeAgent((prompt): boolean => liveSteering.enqueue(candidate, prompt))
@@ -279,10 +357,11 @@ export async function createInteractiveChat(options: CreateInteractiveChatOption
       ...withSession(restoredAgentOptions, { id: sessionId, dir: sessionDirectory }),
       ...(request.seed ? { model: request.seed.model, effort: profileEffort(request.seed.thinking) } : {}),
       ...(request.sessionManager !== undefined ? { sessionManager: request.sessionManager } : {}),
-      skills: skillPaths.length > 0 ? skillPaths : false,
       sandbox,
       interventions: [liveSteering, cedarPermissions, ...configuredInterventions],
     }
+    // Exported source factories retain authored options unless the override contains the key.
+    if (configuredMcpServers) Reflect.set(controllerOptions, 'mcpServers', undefined)
 
     const configSnapshot = config.snapshot()
     let exportProfile = {
@@ -291,7 +370,7 @@ export async function createInteractiveChat(options: CreateInteractiveChatOption
       effort: controllerOptions.effort ?? 'auto',
     }
     let agent: Agent | undefined
-    const configuration = options.requestSetup
+    const configuration = options.configurationEnabled
       ? createConfigurationTool({
           config,
           profile: (): HarnessAgentConfig => exportProfile,
@@ -300,16 +379,8 @@ export async function createInteractiveChat(options: CreateInteractiveChatOption
         })
       : undefined
     if (configuration) configuredTools.push(configuration.tool)
-    let stopConfigurationWatch: (() => void) | undefined
     try {
-      agent = await buildAgent(
-        controllerOptions,
-        configuredTools,
-        peerEndpointId,
-        backgroundActivity,
-        {},
-        request.seed?.backgroundTasksWaitForCompletion ?? false
-      )
+      agent = await buildAgent(controllerOptions, configuredTools, peerEndpointId, backgroundActivity, {}, workspace)
       if (request.seed && request.restoreSeedMessages !== false) {
         agent.messages = [...request.seed.messages]
         // The fork has its own session id, so the `[ref: …]` in the copied messages resolve only against a
@@ -320,11 +391,12 @@ export async function createInteractiveChat(options: CreateInteractiveChatOption
           isLatest: true,
         })
       }
-      if (request.conversation) {
-        agent.loadSnapshot(request.conversation.snapshot)
-        agent.messages = cloneConversation(agent.messages, request.conversation.model === agent.model.modelId)
+      if (conversation) {
+        agent.loadSnapshot(conversation.snapshot)
+        agent.messages = cloneConversation(agent.messages, conversation.model === agent.model.modelId)
         await agent.sessionManager?.saveSnapshot({ target: agent, isLatest: true })
       }
+      if (disposed) throw new Error('Runtime was disposed while building an agent.')
 
       const runtime = new AgentModelRuntime(agent, {
         ...(typeof controllerOptions.model === 'string' ? { initialModel: controllerOptions.model } : {}),
@@ -333,12 +405,11 @@ export async function createInteractiveChat(options: CreateInteractiveChatOption
         discoverProviderModels,
         discoverContextWindow,
         thinking: controllerOptions.effort,
-        ...(sessionId ? { sessionId } : {}),
+        ...(sessionId ? { sessionId: agent.sessionManager?.sessionId ?? sessionId } : {}),
         sessionDir: sessionDirectory,
-        ...(controllerOptions.backgroundTasks === false
-          ? {}
-          : { backgroundTasksWaitForCompletion: request.seed?.backgroundTasksWaitForCompletion ?? false }),
-        newSessionId: createInteractiveSessionId,
+        ...(options.allowRebuild !== false && sessionEnabled && request.sessionManager === undefined
+          ? { newSessionId: createInteractiveSessionId }
+          : {}),
         onModelChange: async (change): Promise<void> => {
           exportProfile = {
             ...exportProfile,
@@ -346,62 +417,79 @@ export async function createInteractiveChat(options: CreateInteractiveChatOption
             effort: change.effort,
             modelModule: change.model === exportProfile.model ? exportProfile.modelModule : null,
           }
-          if (options.persistModelChanges !== false) {
-            await config.setProfileModel(change.model, change.effort)
-          }
+          await options.onModelChange?.(change)
         },
-        restartAgent: async (restartRequest, previousAgent): Promise<Agent> => {
-          const snapshot = restartRequest.preserveSnapshot
-            ? previousAgent.takeSnapshot({ preset: 'session' })
-            : undefined
-          let nextAgent: Agent | undefined
-          try {
-            const overrides: Partial<HarnessAgentOptions> = {
-              model: restartRequest.model,
-              effort: profileEffort(restartRequest.thinking),
-              ...(restartRequest.sessionId !== undefined || restartRequest.sessionDir
-                ? {
-                    session: withSession(controllerOptions, {
-                      ...(restartRequest.sessionId !== undefined ? { id: restartRequest.sessionId ?? undefined } : {}),
-                      ...(restartRequest.sessionDir ? { dir: restartRequest.sessionDir } : {}),
-                    }).session,
+        ...(options.allowRebuild === false
+          ? {}
+          : {
+              restartAgent: async (restartRequest, previousAgent): Promise<Agent> => {
+                if (!restartRequest.preserveConversation && request.sessionManager !== undefined) {
+                  throw new Error(
+                    'The custom session manager owns this session. Start a new session in the agent configuration.'
+                  )
+                }
+                let nextAgent: Agent | undefined
+                try {
+                  await previousAgent.memoryManager?.flush()
+                  const overrides: Partial<HarnessAgentOptions> = {
+                    model: restartRequest.model,
+                    effort: profileEffort(restartRequest.thinking),
+                    ...(restartRequest.sessionId !== undefined || restartRequest.sessionDir
+                      ? {
+                          session: withSession(controllerOptions, {
+                            ...(restartRequest.sessionId !== undefined
+                              ? { id: restartRequest.sessionId ?? undefined }
+                              : {}),
+                            ...(restartRequest.sessionDir ? { dir: restartRequest.sessionDir } : {}),
+                          }).session,
+                        }
+                      : {}),
                   }
-                : {}),
-            }
-            nextAgent = await buildAgent(
-              controllerOptions,
-              configuredTools,
-              peerEndpointId,
-              backgroundActivity,
-              overrides,
-              restartRequest.backgroundTasksWaitForCompletion
-            )
-            if (snapshot) {
-              nextAgent.loadSnapshot(snapshot)
-            } else if (restartRequest.preserveConversation) {
-              nextAgent.messages = cloneConversation(previousAgent.messages, restartRequest.preserveReasoning !== false)
-            }
-          } catch (error) {
-            if (nextAgent) {
-              releaseAgent(nextAgent)
-            }
-            throw error
-          }
-          releaseAgent(previousAgent)
-          agent = nextAgent
-          return nextAgent
-        },
+                  nextAgent = await buildAgent(
+                    controllerOptions,
+                    configuredTools,
+                    peerEndpointId,
+                    backgroundActivity,
+                    overrides,
+                    workspace
+                  )
+                  if (restartRequest.preserveConversation) {
+                    nextAgent.messages = cloneConversation(
+                      previousAgent.messages,
+                      restartRequest.preserveReasoning !== false
+                    )
+                  }
+                } catch (error) {
+                  if (nextAgent) {
+                    await disposeFailedAgent(nextAgent)
+                  }
+                  throw error
+                }
+                releaseAgent(previousAgent)
+                agent = nextAgent
+                return nextAgent
+              },
+            }),
       })
 
       const backend = new StrandsChatBackend(runtime, {
         ...(sourceDefinition ? { sourceDefinition } : {}),
+        sessionIdentity: (): ChatConversation['session'] =>
+          sessionEnabled && request.sessionManager === undefined && runtime.sessionId
+            ? {
+                sessionId: runtime.sessionId,
+                sessionDirectory: runtime.sessionDirectory,
+                workspace,
+                configured: { sessionId: configuredSessionId ?? null, sessionDir: initialSessionDirectory },
+              }
+            : undefined,
         contextWindow: (): Promise<number | undefined> => runtime.contextWindow(),
         taskActivity: backgroundActivity,
         permissions: { broker: permissionBroker, policy: cedarPermissions },
         steering: liveSteering,
         contextScope: workspace,
         dispose: (): void => {
-          stopConfigurationWatch?.()
+          request.onDispose?.()
           agentMessaging.unregister(peerEndpointId)
           backgroundInbox.dispose()
         },
@@ -409,54 +497,179 @@ export async function createInteractiveChat(options: CreateInteractiveChatOption
       const sessions = new FileSessionRuntime(runtime, sessionDirectory, {
         ...(sessionCatalog ? { catalog: sessionCatalog } : {}),
         workspace,
+        currentSessionResumable: sessionEnabled && request.sessionManager === undefined,
       })
-      const skills = new FileSkillsRuntime(skillPaths, () => runtime.agent)
-      const skillNames = (await skills.list()).map((skill) => skill.name)
+      const skills = new AgentSkillsRuntime(
+        () => runtime.agent,
+        (agent) => skillsByAgent.get(agent)
+      )
+      const disposeBackend = backend.dispose.bind(backend)
+      let backendDisposal: Promise<void> | undefined
+      // The controller and owner may both dispose this backend.
+      backend.dispose = (): Promise<void> => {
+        backendDisposal ??= (async (): Promise<void> => {
+          await Promise.allSettled([
+            disposeBackend(),
+            mcp.dispose(),
+            Promise.resolve().then(() => runtime.agent.memoryManager?.flush()),
+          ])
+          releaseAgent(runtime.agent)
+          backends.delete(backend)
+        })()
+        return backendDisposal
+      }
+      backends.add(backend)
+      return {
+        runtime,
+        backend,
+        mcp,
+        skills,
+        sessions,
+        ...(configuration ? { configuration } : {}),
+        profile: () => exportProfile,
+      }
+    } catch (error) {
+      permissionBroker.dispose()
+      if (agent) {
+        await disposeFailedAgent(agent)
+      }
+      backgroundInbox.dispose()
+      await mcp.dispose()
+      throw error
+    }
+  }
+
+  return { createBackend, dispose }
+}
+
+export async function createInteractiveChat(
+  options: CreateInteractiveChatOptions = {},
+  conversations?: ChatConversations,
+  conversationId = conversations?.activeId
+): Promise<ConversationManager> {
+  const initialWorkspace = resolve(options.cwd ?? process.cwd())
+  const configuredSessionSettings = sessionSettings(options.agentOptions?.session)
+  const initialSessionDirectory = resolve(initialWorkspace, configuredSessionSettings.dir ?? DEFAULT_SESSION_DIR)
+  const configuredSessionId = configuredSessionSettings.id
+  // A `SessionManager` instance on `session` is honored like the SDK's `sessionManager`.
+  const configuredSessionManager = options.agentOptions?.sessionManager ?? configuredSessionSettings.manager
+  const config = options.config ?? (await CliConfigStore.load(options.configPath))
+  const agentMessaging = new AgentMessaging()
+  const owner = await createInteractiveRuntime({
+    ...options,
+    config,
+    agentMessaging,
+    configurationEnabled: options.requestSetup !== undefined,
+    onModelChange: async (change): Promise<void> => {
+      if (options.persistModelChanges !== false) await config.setProfileModel(change.model, change.effort)
+    },
+  })
+  const controllerContexts = new WeakMap<ChatController, { workspace: string; sessionDirectory: string }>()
+  const runtimes = new Set<AgentModelRuntime>()
+  let nextPeerEndpoint = 1
+  for (const entry of conversations?.entries ?? []) {
+    nextPeerEndpoint = Math.max(nextPeerEndpoint, Number(entry.id.slice('agent-'.length)) + 1)
+  }
+
+  const createController = async (
+    request: ControllerRequest,
+    conversation?: ChatConversation
+  ): Promise<ChatController> => {
+    const peerEndpointId = request.peerEndpointId ?? `agent-${nextPeerEndpoint++}`
+    const workspace = resolve(request.workspace)
+    const sessionDirectory = resolve(request.sessionDirectory)
+    const configSnapshot = config.snapshot()
+    let resetConfigurationPreview: (() => void) | undefined
+    let stopConfigurationWatch: (() => void) | undefined
+    const {
+      runtime,
+      backend,
+      mcp,
+      skills,
+      sessions,
+      configuration,
+      profile: currentProfile,
+    } = await owner.createBackend(
+      {
+        ...request,
+        peerEndpointId,
+        onConfigurationDiscard: (): void => resetConfigurationPreview?.(),
+        onDispose: (): void => stopConfigurationWatch?.(),
+      },
+      conversation
+    )
+    try {
+      const sessionName = sessions.current ? (await sessions.resolve(sessions.current)).name : undefined
       const controller = new ChatController(backend, {
         runtime: {
           version: HARNESS_VERSION,
-          session: sessionId ?? (request.sessionManager !== undefined ? 'managed' : 'in-memory'),
+          session: sessionName ?? runtime.sessionId ?? (request.sessionManager !== undefined ? 'managed' : 'in-memory'),
+          ...(sessionName ? { sessionName } : {}),
           cwd: workspace,
         },
         settings: { ...configSnapshot.settings, ...request.settings },
         sessions,
         skills,
-        skillNames,
         mcp,
         streamPresentation: DEFAULT_STREAM_PRESENTATION,
-        initialMessages: agent.messages,
-        ...(request.conversation ? { initialTurns: request.conversation.completedTurns } : {}),
+        initialMessages: runtime.agent.messages,
+        ...(conversation ? { initialTurns: conversation.completedTurns } : {}),
+        ...(conversation?.configurationBaseline
+          ? { initialConfigurationBaseline: conversation.configurationBaseline }
+          : {}),
         setSettings: (settings): Promise<void> => config.setSettings(settings),
         ...(options.project ? { project: options.project } : {}),
-        exportAgentProject: (language, destination): Promise<string | undefined> =>
-          options.project
-            ? exportSourceProject(
-                options.project,
-                runtime.agent.name,
-                language,
-                [sessionDirectory, memoryDirectory(controllerOptions.memory)],
-                destination
-              )
-            : exportAgentProject(
-                exportProfile,
-                language,
-                profileSkillPaths,
-                configSnapshot.profileBaseDir ?? initialWorkspace,
-                destination
-              ),
-        ...(options.requestSetup ? { requestSetup: options.requestSetup } : {}),
+        exportAgentProject: (language, destination, output): Promise<string | undefined> => {
+          if (options.project) {
+            return exportSourceProject(
+              options.project,
+              runtime.agent.name,
+              language,
+              [sessionDirectory, ...agentPrivatePaths(runtime.agent)],
+              destination,
+              output
+            )
+          }
+          const profile = configuration?.profile() ?? currentProfile()
+          const baseDir = configSnapshot.profileBaseDir ?? initialWorkspace
+          return exportAgentProject(
+            profile,
+            language,
+            resolveSkillPaths(
+              typeof profile.skills === 'object' ? [...profile.skills] : profile.skills,
+              baseDir,
+              false
+            ),
+            baseDir,
+            destination,
+            output
+          )
+        },
+        ...(configuration
+          ? {
+              configurationSource: (): ChatConfigurationSource =>
+                configurationSource(
+                  configuration.profile(),
+                  options.project,
+                  configSnapshot.profileBaseDir ?? initialWorkspace
+                ),
+            }
+          : {}),
+        ...(options.requestSetup
+          ? {
+              requestSetup: options.requestSetup,
+              useExportedProject: (path: string): void =>
+                options.requestSetup?.({ agentProject: path, conversationId: peerEndpointId }),
+            }
+          : {}),
         ...(options.requestSetup && !options.project
           ? {
-              builtinTools: createBuiltinToolsRuntime(
-                config,
-                (): HarnessAgentConfig => exportProfile,
-                options.requestSetup,
-                peerEndpointId
-              ),
+              builtinTools: createBuiltinToolsRuntime(currentProfile, options.requestSetup, peerEndpointId),
             }
           : {}),
         peerEndpointId,
       })
+      resetConfigurationPreview = (): void => controller.refreshConfiguration(true)
       if (configuration) {
         stopConfigurationWatch = controller.subscribe(() => {
           if (controller.busy) return
@@ -488,66 +701,141 @@ export async function createInteractiveChat(options: CreateInteractiveChatOption
         enqueue: (message): boolean => controller.enqueuePeerMessage(message),
       })
       controllerContexts.set(controller, { workspace, sessionDirectory })
+      runtimes.add(runtime)
       return controller
     } catch (error) {
-      permissionBroker.dispose()
-      if (agent) {
-        releaseAgent(agent)
-      }
-      backgroundInbox.dispose()
-      await mcp.dispose()
+      await backend.dispose()
       throw error
     }
   }
 
+  const entries: InitialConversations['entries'][number][] = []
   try {
-    const primary = await createController({
-      workspace: initialWorkspace,
-      sessionDirectory: initialSessionDirectory,
-      ...(configuredSessionId ? { sessionId: configuredSessionId } : {}),
-      ...(configuredSessionManager !== undefined ? { sessionManager: configuredSessionManager } : {}),
-      ...(options.conversation ? { conversation: options.conversation } : {}),
-    })
-    return new ConversationManager(primary, {
-      fork: async (source): Promise<ChatController> => {
-        const seed = source.backend.forkState?.()
-        const context = controllerContexts.get(source)
-        if (!seed || !context) {
-          throw new Error('Only Strands-backed conversations can be forked.')
-        }
-        const stash = await source.backend.forkStash?.()
-        return createController({
-          workspace: context.workspace,
-          sessionDirectory: context.sessionDirectory,
-          seed: { ...seed, ...(stash && { stash }) },
-          settings: source.getSnapshot().settings,
-        })
-      },
-      resume: async (source, target: SessionTarget): Promise<ChatController> => {
-        const seed = source.backend.forkState?.()
-        if (!seed) {
-          throw new Error('Only Strands-backed conversations can open saved sessions.')
-        }
-        return createController({
-          workspace: target.workspace,
-          sessionDirectory: target.sessionDirectory,
-          sessionId: target.sessionId,
-          seed,
-          restoreSeedMessages: false,
-          settings: source.getSnapshot().settings,
-        })
-      },
-      dispose: disposeShared,
-      agentMessaging,
-      voice: new PythonVoiceSession({ cwd: initialWorkspace }),
-    })
+    if (conversations) {
+      for (const entry of conversations.entries) {
+        const session = entry.conversation.session
+        const preserveSession =
+          session &&
+          (entry.id !== conversationId ||
+            (session.configured.sessionId === (configuredSessionId ?? null) &&
+              session.configured.sessionDir === initialSessionDirectory))
+        const controller = await createController(
+          {
+            peerEndpointId: entry.id,
+            workspace: entry.conversation.workspace,
+            sessionDirectory: preserveSession ? session.sessionDirectory : initialSessionDirectory,
+            ...(preserveSession
+              ? { sessionId: session.sessionId }
+              : configuredSessionId
+                ? { sessionId: configuredSessionId }
+                : {}),
+            ...(entry.id === 'agent-1' && configuredSessionManager !== undefined
+              ? { sessionManager: configuredSessionManager }
+              : {}),
+            ...(!options.project && entry.id !== conversationId && entry.conversation.selection
+              ? { selection: entry.conversation.selection }
+              : {}),
+          },
+          entry.conversation
+        )
+        entries.push({ id: entry.id, title: entry.title, description: entry.description, controller })
+      }
+    } else {
+      const primary = await createController({
+        workspace: initialWorkspace,
+        sessionDirectory: initialSessionDirectory,
+        ...(configuredSessionId ? { sessionId: configuredSessionId } : {}),
+        ...(configuredSessionManager !== undefined ? { sessionManager: configuredSessionManager } : {}),
+      })
+      entries.push({
+        id: 'agent-1',
+        title: primary.backend.name,
+        description: primary.backend.info?.().description || 'Primary agent',
+        controller: primary,
+      })
+    }
+    const project = options.project
+    return new ConversationManager(
+      { activeId: conversations?.activeId ?? 'agent-1', entries },
+      {
+        fork: async (source): Promise<ChatController> => {
+          const seed = source.backend.forkState?.()
+          const context = controllerContexts.get(source)
+          if (!seed || !context) {
+            throw new Error('Only Strands-backed conversations can be forked.')
+          }
+          const stash = await source.backend.forkStash?.()
+          return createController({
+            workspace: context.workspace,
+            sessionDirectory: context.sessionDirectory,
+            seed: { ...seed, ...(stash && { stash }) },
+            settings: source.getSnapshot().settings,
+          })
+        },
+        resume: async (source, target: SessionTarget): Promise<ChatController> => {
+          const seed = source.backend.forkState?.()
+          if (!seed) {
+            throw new Error('Only Strands-backed conversations can open saved sessions.')
+          }
+          return createController({
+            workspace: target.workspace,
+            sessionDirectory: target.sessionDirectory,
+            sessionId: target.sessionId,
+            seed,
+            restoreSeedMessages: false,
+            settings: source.getSnapshot().settings,
+          })
+        },
+        dispose: owner.dispose,
+        agentMessaging,
+        voice: new PythonVoiceSession({ cwd: initialWorkspace }),
+        ...(project && options.requestSetup
+          ? {
+              project,
+              projectPrivatePaths: [
+                initialSessionDirectory,
+                ...[...runtimes].flatMap((runtime) =>
+                  agentPrivatePaths(runtime.agent).map((path) => resolve(initialWorkspace, path))
+                ),
+              ],
+              reloadProject: (conversationId: string): void =>
+                options.requestSetup?.({ agentProject: project.entrypoint, conversationId }),
+            }
+          : {}),
+      }
+    )
   } catch (error) {
-    await disposeShared()
+    await Promise.allSettled(entries.map(({ controller }) => controller.dispose()))
+    await owner.dispose()
     throw error
   }
 }
 
-function cloneConversation(messages: readonly Message[], preserveReasoning: boolean): Message[] {
+function withContextOffloadThreshold(
+  options: HarnessAgentOptions,
+  threshold: ContextOffloadThreshold
+): HarnessAgentOptions {
+  const contextManager = options.contextManager
+  if (
+    threshold === 'default' ||
+    (contextManager !== undefined && contextManager !== 'auto' && contextManager !== 'agentic')
+  ) {
+    return options
+  }
+  const summarizeUtilization = contextManager === 'agentic' ? 1 : 0.85
+  return {
+    ...options,
+    contextManager: {
+      strategies: [
+        Offload.truncate('toolResults', { previewTokens: 750 }).when({ threshold }),
+        Offload.summarize('*').when({ utilization: summarizeUtilization, preserveRecent: 4 }),
+      ],
+    },
+  }
+}
+
+/** @internal */
+export function cloneConversation(messages: readonly Message[], preserveReasoning: boolean): Message[] {
   return messages.flatMap((message) => {
     const clone = message.clone()
     if (!preserveReasoning) {
@@ -571,19 +859,18 @@ function createInteractiveSessionId(): string {
 }
 
 export function interactiveBackgroundTasks(
-  options: HarnessAgentOptions,
-  waitForCompletion = false
+  options: HarnessAgentOptions
 ): Exclude<HarnessAgentOptions['backgroundTasks'], undefined> {
   const configured = options.backgroundTasks
   if (configured === false) {
     return false
   }
-  return { ...(configured === true ? {} : configured), waitForCompletion }
+  return { ...(configured === true ? {} : configured), waitForCompletion: false }
 }
 
-async function loadSessionCatalog(path: string | undefined): Promise<SessionRootCatalog | undefined> {
+async function loadSessionCatalog(root: string | undefined): Promise<SessionRootCatalog | undefined> {
   try {
-    return await SessionRootCatalog.load(path)
+    return await SessionRootCatalog.load(root)
   } catch {
     return undefined
   }
@@ -602,7 +889,7 @@ async function registerSessionRoot(
 }
 
 async function workspaceMcpOptions(
-  options: CreateInteractiveChatOptions,
+  options: Pick<CreateInteractiveChatOptions, 'mcpPaths' | 'mcpStrictPaths' | 'mcpDigests'>,
   initialWorkspace: string,
   workspace: string,
   discovery: boolean

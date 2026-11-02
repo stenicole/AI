@@ -28,6 +28,7 @@ import { createHarness, makeSubagent } from '@strands-agents/harness'
 import { readBackgroundTasks } from '../src/tui/background/tasks.js'
 import { ChatController } from '../src/tui/chat/controller.js'
 import { ChatView } from '../src/tui/view/chat-view.js'
+import { LiveSteering } from '../src/tui/steering.js'
 
 describe('usage normalization', () => {
   it('includes Anthropic cache reads and writes in prompt occupancy', () => {
@@ -186,7 +187,7 @@ describe('delegated run usage', () => {
     expect(totals).toEqual([166, 8])
   })
 
-  it.each(['backend', 'acp', 'plain'] as const)(
+  it.each(['backend', 'effort rebuild', 'failed effort rebuild', 'acp', 'plain'] as const)(
     'includes subagent and background grandchild usage through %s without using their context size',
     async (mode) => {
       const grandchild = new Agent({ name: 'grandchild', model: new MeteredModel(90, 10), printer: false })
@@ -204,9 +205,28 @@ describe('delegated run usage', () => {
       })
       // Two root calls, three child calls (including background delivery), one grandchild call.
       const expected = 2 * 8 + 3 * 25 + 100
-      if (mode === 'backend') {
-        const backend = new StrandsChatBackend(new AgentModelRuntime(root))
+      if (mode === 'backend' || mode === 'effort rebuild' || mode === 'failed effort rebuild') {
+        const previous = new Agent({ model: new MeteredModel(5, 3), printer: false })
+        const restartAgent = vi.fn(async () => root)
+        const runtime = new AgentModelRuntime(mode === 'backend' ? root : previous, {
+          initialModel: 'bedrock/anthropic.claude-sonnet-4-6',
+          thinking: 'high',
+          restartAgent,
+        })
+        const backend = new StrandsChatBackend(runtime)
         try {
+          if (mode !== 'backend') {
+            await runtime.setEffort('low')
+          }
+          if (mode === 'failed effort rebuild') {
+            restartAgent.mockRejectedValueOnce(new Error('replacement failed'))
+            const snapshot = vi.spyOn(previous, 'takeSnapshot')
+            await expect(backend.stream('work').next()).rejects.toThrow('replacement failed')
+            expect(runtime.agent).toBe(previous)
+            expect(snapshot).not.toHaveBeenCalled()
+            expect((await previous.invoke('still usable')).stopReason).toBe('endTurn')
+            snapshot.mockRestore()
+          }
           const stream = backend.stream('work')
           let next = await stream.next()
           while (!next.done) {
@@ -246,7 +266,7 @@ describe('delegated run usage', () => {
     }
   )
 
-  async function detachedAgents(): Promise<{ root: Agent; child: Agent; release: () => void }> {
+  async function detachedAgents(steering?: LiveSteering): Promise<{ root: Agent; child: Agent; release: () => void }> {
     let release!: () => void
     const ready = new Promise<void>((resolve) => {
       release = resolve
@@ -264,6 +284,7 @@ describe('delegated run usage', () => {
       builtinTools: [],
       builtinPlugins: [],
       backgroundTasks: { waitForCompletion: false },
+      ...(steering ? { interventions: [steering] } : {}),
       session: false,
       memory: false,
       caching: false,
@@ -273,6 +294,41 @@ describe('delegated run usage', () => {
     })
     return { root, child, release }
   }
+
+  // https://github.com/strands-agents/harness-sdk/issues/4702
+  it('accepts steering and follow-ups while detached work runs and delivers its result once', async () => {
+    const steering = new LiveSteering()
+    const { root, child, release } = await detachedAgents(steering)
+    const backend = new StrandsChatBackend(new AgentModelRuntime(root), { steering })
+    const controller = new ChatController(backend)
+    try {
+      await controller.submit('Start background work')
+      await Promise.all([controller.steer('Change direction'), controller.submit('Follow up')])
+      expect(controller.getSnapshot()).toMatchObject({
+        status: 'idle',
+        pendingSteering: [],
+        queuedPrompts: [],
+        completedTurns: [{ status: 'complete' }, { status: 'complete' }, { status: 'complete' }],
+      })
+      expect(readBackgroundTasks(root)).toEqual([expect.objectContaining({ status: 'working' })])
+      expect(child.cancelSignal.aborted).toBe(false)
+      const firstTurn = controller.getSnapshot().completedTurns[0]!
+      expect(firstTurn.entries).toContainEqual(expect.objectContaining({ type: 'tool', background: true }))
+
+      release()
+      await vi.waitFor(() => {
+        expect(controller.getSnapshot().completedTurns.filter((turn) => turn.source === 'background')).toEqual([
+          expect.objectContaining({ status: 'complete' }),
+        ])
+        expect(backend.hasReadyBackgroundResults()).toBe(false)
+      })
+      expect(child.cancelSignal.aborted).toBe(false)
+      expect(readBackgroundTasks(root)).toEqual([])
+    } finally {
+      release()
+      await controller.dispose()
+    }
+  })
 
   it('waits for background retries decided by late hooks before reporting final spend', async () => {
     const { root, child, release } = await detachedAgents()
@@ -324,9 +380,14 @@ describe('delegated run usage', () => {
     }
   })
 
-  it.each(['after turn', 'before subscription'] as const)(
-    'displays completed detached spend on the originating TUI turn when it finishes %s',
-    async (timing) => {
+  it.each([
+    ['after turn', false],
+    ['before subscription', false],
+    ['after turn', true],
+    ['before subscription', true],
+  ] as const)(
+    'displays completed detached spend on the originating TUI turn when it finishes %s (effort rebuild: %s)',
+    async (timing, rebuild) => {
       const { root, release } = await detachedAgents()
       let finishContext!: () => void
       let contextStarted!: () => void
@@ -336,7 +397,18 @@ describe('delegated run usage', () => {
       const contextReady = new Promise<void>((resolve) => {
         contextStarted = resolve
       })
-      const backend = new StrandsChatBackend(new AgentModelRuntime(root, { backgroundTasksWaitForCompletion: false }), {
+      const runtime = new AgentModelRuntime(
+        rebuild ? new Agent({ model: new MeteredModel(5, 3), printer: false }) : root,
+        {
+          initialModel: 'bedrock/anthropic.claude-sonnet-4-6',
+          thinking: 'high',
+          restartAgent: async () => root,
+        }
+      )
+      if (rebuild) {
+        await runtime.setEffort('low')
+      }
+      const backend = new StrandsChatBackend(runtime, {
         contextWindow: async () => {
           contextStarted()
           await contextGate
@@ -370,16 +442,18 @@ describe('delegated run usage', () => {
         await vi.waitFor(() => {
           expect(controller.getSnapshot().completedTurns[0]?.usage?.totalTokens).toBe(116)
         })
-        expect(finalizedContext).toHaveBeenCalledWith({
-          currentTokens: 5,
-          projectedTokens: 8,
-          contextWindow: 1000,
-          inputTokens: 100,
-          outputTokens: 16,
-          totalTokens: 116,
-          cacheReadInputTokens: 0,
-          cacheWriteInputTokens: 0,
-        })
+        expect(finalizedContext).toHaveBeenCalledWith(
+          expect.objectContaining({
+            currentTokens: 5,
+            projectedTokens: 8,
+            contextWindow: 1000,
+            inputTokens: 100,
+            outputTokens: 16,
+            totalTokens: 116,
+            cacheReadInputTokens: 0,
+            cacheWriteInputTokens: 0,
+          })
+        )
         await vi.waitFor(() => {
           expect(controller.getSnapshot().completedTurns[1]).toMatchObject({
             source: 'background',
