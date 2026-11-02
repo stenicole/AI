@@ -20,9 +20,8 @@ import { tool } from '../tools/tool-factory.js'
 import { z } from 'zod'
 import { logger } from '../logging/logger.js'
 import { normalizeError } from '../errors.js'
-import { isUserTurn, createInjectionMiddleware } from '../injection/message-injection.js'
+import { isUserTurn, addInjection } from '../injection/message-injection.js'
 import { escapeXmlText, escapeXmlAttr } from '../injection/xml.js'
-import { InvokeModelStage } from '../middleware/index.js'
 import { Tracer } from '../telemetry/tracer.js'
 import { context, trace } from '@opentelemetry/api'
 
@@ -51,6 +50,11 @@ const DEFAULT_MAX_ENTRIES = 5
 /** Flattens nested AggregateErrors so the leaves are concrete reasons, not errors-of-errors. */
 function _flattenReasons(reasons: unknown[]): unknown[] {
   return reasons.flatMap((reason) => (reason instanceof AggregateError ? _flattenReasons(reason.errors) : [reason]))
+}
+
+/** Injected text, recalled memories included, isn't the user's own words, so extraction never saves it. */
+function withoutInjectedText(message: MessageData): MessageData {
+  return { ...message, content: message.content.filter((block) => !('text' in block && block.metadata?.injected)) }
 }
 
 /**
@@ -211,9 +215,9 @@ export class MemoryManager implements Plugin {
    * Wires up two independent behaviors:
    * - **Extraction**: for any store configured with {@link ExtractionConfig}, buffers conversation
    *   messages and attaches each store's triggers. A no-op when no store uses extraction.
-   * - **Injection**: when enabled, registers an `InvokeModelStage` middleware that folds retrieved
-   *   memory into the model input for each call without touching durable history. See
-   *   {@link _provideMemoryContext}, the `renderContent` callback the middleware invokes.
+   * - **Injection**: when enabled, writes retrieved memory into the latest user message before each
+   *   model call, as a text block marked `metadata.injected`. See {@link _provideMemoryContext}, the
+   *   `renderContent` callback the injection invokes.
    *
    * @param agent - The agent this plugin is being attached to
    */
@@ -243,7 +247,7 @@ export class MemoryManager implements Plugin {
 
     // Buffer every message the agent adds, so extraction has its own copy to save from.
     agent.addHook(MessageAddedEvent, (event) => {
-      coordinator.record(event.message.toJSON())
+      coordinator.record(withoutInjectedText(event.message.toJSON()))
     })
 
     for (const { store, config } of this._extractionStores) {
@@ -254,27 +258,24 @@ export class MemoryManager implements Plugin {
   }
 
   /**
-   * Registers the injection middleware when injection is enabled. Folds retrieved memory into the
-   * model input for each call via {@link _provideMemoryContext}, without touching durable history. A
-   * no-op when injection is disabled.
+   * Registers injection when it is enabled: retrieved memory from {@link _provideMemoryContext} is
+   * written into the latest user message before each model call. A no-op when injection is disabled.
    */
   private _initInjection(agent: LocalAgent): void {
     const config = this._injectionConfig
     if (config === false) {
       return
     }
-    agent.addMiddleware(
-      InvokeModelStage.Input,
-      createInjectionMiddleware({
-        ...(config.trigger !== undefined && { trigger: config.trigger }),
-        renderContent: (context) => this._provideMemoryContext(context.messages, config),
-      })
-    )
+    addInjection(agent, {
+      source: this.name,
+      ...(config.trigger !== undefined && { trigger: config.trigger }),
+      renderContent: (context) => this._provideMemoryContext(context.messages, config),
+    })
   }
 
   /**
    * Produces the memory context text to inject for a model call, or `undefined` to skip. This is the
-   * `renderContent` callback the injection middleware invokes (see {@link initAgent}).
+   * `renderContent` callback {@link initAgent} passes to `addInjection`.
    *
    * Derives a query (the configured callback or an adaptive default), searches memory, and renders the
    * top entries. Skips silently (returns `undefined`) when no query can be derived or the search

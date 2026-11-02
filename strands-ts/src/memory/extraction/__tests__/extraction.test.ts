@@ -194,6 +194,21 @@ describe('MemoryManager extraction', () => {
       expect(batch[0]!.role).toBe('user')
       expect(batch[1]!.role).toBe('assistant')
     })
+
+    it('leaves injected text, such as recalled memories, out of what it saves', async () => {
+      const store = createExtractionStore('s', { trigger: [new InvocationTrigger()] }, 'addMessages')
+      const mm = new MemoryManager({ stores: [store], injection: false })
+      const agent = createMockAgent()
+      await mm.initAgent(agent)
+      const recalled = new TextBlock('\n\n<memory>likes tea</memory>', {
+        metadata: { injected: { source: 'strands:memory-manager' } },
+      })
+      await addMessages(agent, new Message({ role: 'user', content: [new TextBlock('hi'), recalled] }))
+      await fireInvocation(agent, mm)
+
+      const batch = store.addMessages.mock.calls[0]![0] as MessageData[]
+      expect(batch.map((message) => message.content)).toStrictEqual([[{ text: 'hi' }]])
+    })
   })
 
   describe('addMessages context (per-message seqs)', () => {
@@ -699,7 +714,7 @@ describe('MemoryManager extraction', () => {
 
     it('does not register hooks when no store has extraction', async () => {
       const store: MemoryStore = { name: 's', writable: true, search: vi.fn(), add: vi.fn() }
-      const mm = new MemoryManager({ stores: [store] })
+      const mm = new MemoryManager({ stores: [store], injection: false })
       const agent = createMockAgent()
       await mm.initAgent(agent)
       expect(agent.trackedHooks).toHaveLength(0)

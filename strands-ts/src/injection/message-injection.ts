@@ -1,55 +1,87 @@
+import { BeforeModelCallEvent } from '../hooks/events.js'
+import { HookOrder } from '../hooks/types.js'
 import { Message, TextBlock } from '../types/messages.js'
-import type { MessageData } from '../types/messages.js'
+import type { ContentBlock, MessageData } from '../types/messages.js'
+import type { LocalAgent } from '../types/agent.js'
 import { logger } from '../logging/logger.js'
 import { normalizeError } from '../errors.js'
-import type { InvokeModelContext } from '../middleware/index.js'
-import type { InjectionMiddlewareOptions, InjectionTrigger, InjectionContext } from './types.js'
+import type { InjectionOptions, InjectionTrigger, InjectionContext } from './types.js'
 
 /**
- * Builds an `InvokeModelStage` `Input` handler that folds {@link InjectionMiddlewareOptions.renderContent}'s
- * text into the latest user message, ephemerally — the model sees the augmented input for this one call
- * while the agent's durable history is never touched.
+ * Writes {@link InjectionOptions.renderContent}'s text into the latest user message before each model
+ * call, as a {@link TextBlock} marked with `metadata.injected`, and leaves it there.
  *
- * Runs as an input-phase transformer (`(ctx) => ctx`): it gates on the resolved trigger, asks
- * `renderContent` for the text, and returns a context with the folded messages. Anything that skips —
- * the trigger not firing, `renderContent` returning empty, or any callback throwing — returns the
- * context unchanged so the model call proceeds (fail open). The injected text never enters durable
- * history because the input phase only rewrites the per-call context, not the agent's stored messages.
+ * The write happens in a `BeforeModelCallEvent` hook that runs after the SDK's other hooks, so it reaches
+ * that model call and lands in any user message those hooks added. It only ever touches the latest message
+ * while it is a user message, which the model has not answered yet. Every later request therefore starts
+ * with the earlier one unchanged.
  *
- * @param opts - The trigger and `renderContent` callback the handler uses
- * @returns An `InvokeModelStage.Input` handler that returns a (possibly) folded context
+ * No event fires for the write. Listeners that see messages as they are added (the session manager, the
+ * context manager's stash, memory extraction) heard this message before the text was written, and a session
+ * saves the whole conversation, so it picks the text up at its next save.
+ *
+ * An injection writes into a message at most once, so a retry, a forced structured output call or a resume
+ * sends the same request again. Across turns, text equal to the last text its source wrote is not written
+ * again while that block is still in the conversation. Both checks read the conversation itself, so they hold
+ * after a session restore. Anything that skips — a cancelled call, the trigger not firing, `renderContent`
+ * returning empty, or any callback throwing — leaves the conversation unchanged so the model call proceeds
+ * (fail open).
+ *
+ * @param agent - The agent to inject into
+ * @param opts - The source name, trigger and `renderContent` callback
  * @internal Delivery primitive. Reach injection through `ContextInjector` or `MemoryManager`.
  */
-export function createInjectionMiddleware(
-  opts: InjectionMiddlewareOptions
-): (context: InvokeModelContext) => Promise<InvokeModelContext> {
+export function addInjection(agent: LocalAgent, opts: InjectionOptions): void {
   const trigger = resolveTrigger(opts.trigger)
-  return async (context) => {
-    const agent = context.agent
-    const injectionContext: InjectionContext = {
-      messages: context.messages.map((message) => message.toJSON()),
-      appState: agent.appState,
-      agent,
-    }
-    if (!trigger(injectionContext)) {
-      return context
-    }
 
-    let text: string | undefined
-    try {
-      text = await opts.renderContent(injectionContext)
-    } catch (error) {
-      logger.warn(`reason=<${normalizeError(error).message}> | injection renderContent threw; skipping injection`)
-      return context
-    }
-    if (!text?.trim()) {
-      return context
-    }
+  agent.addHook(
+    BeforeModelCallEvent,
+    async (event) => {
+      const messages = event.agent.messages
+      const latest = messages.at(-1)
+      if (event.cancel || !latest || latest.role !== 'user') {
+        return
+      }
+      // A retry, forced structured output call or resume re-enters a message this injection already wrote into.
+      if (latest.content.some((block) => isInjectedBy(block, opts.source))) {
+        return
+      }
 
-    const { messages: folded, appended } = foldIntoLastUserMessage([...context.messages], text)
-    // Accumulate: several producers may append on one call, and the cache point precedes all of it.
-    return { ...context, messages: folded, dynamicTrailingBlocks: (context.dynamicTrailingBlocks ?? 0) + appended }
-  }
+      const injectionContext: InjectionContext = {
+        messages: messages.map((message) => message.toJSON()),
+        appState: event.agent.appState,
+        agent: event.agent,
+      }
+      if (!trigger(injectionContext)) {
+        return
+      }
+
+      let rendered: string | undefined
+      try {
+        rendered = await opts.renderContent(injectionContext)
+      } catch (error) {
+        logger.warn(`reason=<${normalizeError(error).message}> | injection renderContent threw; skipping injection`)
+        return
+      }
+      if (!rendered?.trim()) {
+        return
+      }
+
+      // Some providers join adjacent text blocks, which would run this onto the content before it.
+      const text = latest.content.length > 0 && !rendered.startsWith('\n') ? `\n\n${rendered}` : rendered
+      if (text === lastInjectedText(messages, opts.source)) {
+        return
+      }
+
+      messages[messages.length - 1] = new Message({
+        role: 'user',
+        content: [...latest.content, new TextBlock(text, { metadata: { injected: { source: opts.source } } })],
+        trackingId: latest.trackingId,
+        ...(latest.metadata !== undefined && { metadata: latest.metadata }),
+      })
+    },
+    { order: HookOrder.SDK_LAST }
+  )
 }
 
 /**
@@ -97,53 +129,11 @@ export function isUserTurn(messages: MessageData[]): boolean {
   return !!last && last.role === 'user' && !last.content.some((block) => 'toolResult' in block)
 }
 
-/**
- * Folds `text` into the most recent `user` message as a {@link TextBlock}, returning a NEW array. Other
- * messages are returned as-is.
- *
- * Folding into the existing user message (rather than inserting a standalone message) keeps role
- * alternation valid in both chat and the autonomous tool loop.
- *
- * The text is always **appended**. A tool result has to stay the first content block in the turn that
- * answers a tool use, and a trailing run is the only placement a provider can keep out of its cached
- * prefix — text ahead of the stable conversation would invalidate the cache from the first block onward.
- *
- * {@link Message} fields are readonly, so the target is rebuilt as a new {@link Message}. When there is
- * no `user` message, the input array is returned unchanged.
- *
- * @param messages - The conversation to fold into
- * @param text - The text to fold into the most recent user message
- * @returns The folded conversation and how many trailing blocks of its last message are per-call
- *   content: 1 when the fold landed on the last message, 0 otherwise (including when there is no user
- *   message to fold into, in which case the input array is returned unchanged)
- * @internal Delivery primitive. Reach injection through `ContextInjector` or `MemoryManager`.
- */
-export function foldIntoLastUserMessage(messages: Message[], text: string): { messages: Message[]; appended: number } {
-  let targetIndex = -1
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]!.role === 'user') {
-      targetIndex = i
-      break
-    }
-  }
-  if (targetIndex < 0) {
-    return { messages, appended: 0 }
-  }
+function isInjectedBy(block: ContentBlock, source: string): block is TextBlock {
+  return block.type === 'textBlock' && block.metadata?.injected?.source === source
+}
 
-  const target = messages[targetIndex]!
-  // Some providers concatenate adjacent text blocks, which would run this onto the user's own words.
-  const separator = target.content.length > 0 && !text.startsWith('\n') ? '\n\n' : ''
-  const injected = new TextBlock(`${separator}${text}`)
-  const content = [...target.content, injected]
-  const folded = new Message({
-    role: target.role,
-    content,
-    // Folding injects content into the same logical message, so keep its tracking id.
-    trackingId: target.trackingId,
-    ...(target.metadata !== undefined && { metadata: target.metadata }),
-  })
-
-  const result = [...messages]
-  result[targetIndex] = folded
-  return { messages: result, appended: targetIndex === messages.length - 1 ? 1 : 0 }
+/** Text of the latest block `source` injected that is still in the conversation. */
+function lastInjectedText(messages: readonly Message[], source: string): string | undefined {
+  return messages.flatMap((message) => message.content.filter((block) => isInjectedBy(block, source))).at(-1)?.text
 }
