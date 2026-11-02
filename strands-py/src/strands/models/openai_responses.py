@@ -646,6 +646,10 @@ class OpenAIResponsesModel(Model):
     def _format_request_messages(cls, messages: Messages) -> list[dict[str, Any]]:
         """Format an OpenAI compatible messages array.
 
+        User turns emit tool calls and tool results before text so a function call
+        output stays next to its function call. Assistant turns emit text, then
+        function calls.
+
         Args:
             messages: List of message objects to be processed by the model.
 
@@ -692,6 +696,11 @@ class OpenAIResponsesModel(Model):
                 if "toolResult" in content
             ]
 
+            # A function_call_output must follow its function_call with no user text between them.
+            if role == "user":
+                formatted_messages.extend(formatted_tool_calls)
+                formatted_messages.extend(formatted_tool_messages)
+
             if formatted_contents:
                 if role == "assistant":
                     # Only the string EasyInputMessage form is a valid assistant *input* shape
@@ -718,8 +727,9 @@ class OpenAIResponsesModel(Model):
                         }
                     )
 
-            formatted_messages.extend(formatted_tool_calls)
-            formatted_messages.extend(formatted_tool_messages)
+            if role != "user":
+                formatted_messages.extend(formatted_tool_calls)
+                formatted_messages.extend(formatted_tool_messages)
 
         _log_skipped_blocks(logger, skipped)
 
