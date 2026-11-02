@@ -1,6 +1,6 @@
 ---
 title: Context Injector
-description: "Fold real-time text into the model input before each call with the ContextInjector plugin: a clock, environment facts, or a lookup, not stored in history."
+description: "Add real-time text to the model input before each call with the ContextInjector plugin: a clock, environment facts, a sandbox descriptor, or a lookup."
 tags: [token-management]
 sourceLinks:
   - path: strands-py/src/strands/vended_plugins/context_injector/plugin.py
@@ -8,11 +8,35 @@ sourceLinks:
 addedDate: 2026-06-17
 ---
 
-The `ContextInjector` plugin folds real-time text into the model input before each call. The text is added to that single call's input only: it is never written to the conversation history, so it is not persisted or replayed on later turns. Use it for context the agent should always have but that does not belong in the stored history: the current time, a sandbox descriptor, environment facts, or a retrieval lookup.
+To give your agent context it should always have, such as the current time, a sandbox
+descriptor, environment facts, or a retrieval lookup, use the `ContextInjector` plugin. It
+adds real-time text to the model input before each call.
 
 ## How It Works
 
-A `ContextInjector` has two parts. The callback function decides **what** text to fold into the next model call's input. The trigger decides **when** the callback is called. The injected text is **ephemeral by design**: it augments the model input for that one call and never persists into the durable conversation or session.
+A `ContextInjector` has two parts. The callback function decides **what** text to add to
+the next model call's input. The trigger decides **when** the callback is called. Whether
+the text stays in the conversation afterward depends on the SDK:
+
+<Tabs>
+<Tab label="Python">
+
+The text augments the model input for that one call only. The plugin never writes it to
+the conversation or the session, so later turns don't replay it.
+</Tab>
+<Tab label="TypeScript">
+
+The injector writes the text into the latest user message as a text block with
+`metadata.injected` set. The text stays there like the rest of the conversation, and the
+session saves it too. The injector never edits earlier messages, so prompt caching keeps
+working across turns.
+
+Each injector finds its own blocks by `name`, so give each one a stable, distinct name. It
+writes text again only when the text changes, or after a conversation manager removes its
+last block. A value that changes on every call, such as a timestamp, adds a block every
+time the injector runs. Render the date instead when the time of day doesn't matter.
+</Tab>
+</Tabs>
 
 This is the same injection mechanism that powers [memory context injection](../memory/managing-memory#context-injection). `ContextInjector` is the generic surface for any consumer.
 
