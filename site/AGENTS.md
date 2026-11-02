@@ -3,9 +3,11 @@
 This document provides guidance for AI agents working on the Strands Agents documentation site (the `site/` directory). For human contributor guidelines, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Purpose and Scope
+
 This directory contains the documentation site for Strands Agents, providing guides on how to develop with the SDK in both Python and TypeScript.
 
 **AGENTS.md** contains agent-specific repository information including:
+
 - Directory structure with summaries of what is included in each directory
 - Development workflow instructions for agents to follow when developing features
 - Coding patterns and testing patterns to follow when writing code
@@ -17,10 +19,10 @@ This directory contains the documentation site for Strands Agents, providing gui
 
 When working on SDK features or documentation, familiarize yourself with these team processes:
 
-* **[Feature Lifecycle Process](../team/FEATURE_LIFECYCLE.md)**: How features are added, versioned, deprecated, and graduated from experimental status
-* **[API Bar Raising](../team/API_BAR_RAISING.md)**: Standards for API design quality
-* **[Decisions](../team/DECISIONS.md)**: Key architectural and design decisions
-* **[Tenets](../team/TENETS.md)**: Core principles guiding SDK development
+- **[Feature Lifecycle Process](../team/FEATURE_LIFECYCLE.md)**: How features are added, versioned, deprecated, and graduated from experimental status
+- **[API Bar Raising](../team/API_BAR_RAISING.md)**: Standards for API design quality
+- **[Decisions](../team/DECISIONS.md)**: Key architectural and design decisions
+- **[Tenets](../team/TENETS.md)**: Core principles guiding SDK development
 
 These documents define the standards and processes that ensure consistency and quality across the Strands SDK.
 
@@ -45,13 +47,13 @@ On Windows, these symlinks require Developer Mode or `git config core.symlinks t
     └── code-verification.md # Verifying code examples against SDK source
 ```
 
-| Skill | Purpose | Sample triggers |
-|-------|---------|-----------------|
-| `docs-writer`   | Draft or rewrite doc pages          | "write a doc", "draft a page", "rewrite the quickstart" |
-| `docs-reviewer` | Review drafts before PR submission  | "review this draft", "is this ready to ship" |
-| `docs-audit`    | Assess published pages for quality  | "audit this page", "check docs quality" |
-| `docs-verifier` | Verify every claim and example against source | "verify this page", "fact-check the docs" |
-| `docs-planner`  | Prioritize the docs backlog         | "plan docs work", "what docs need writing" |
+| Skill           | Purpose                                       | Sample triggers                                         |
+| --------------- | --------------------------------------------- | ------------------------------------------------------- |
+| `docs-writer`   | Draft or rewrite doc pages                    | "write a doc", "draft a page", "rewrite the quickstart" |
+| `docs-reviewer` | Review drafts before PR submission            | "review this draft", "is this ready to ship"            |
+| `docs-audit`    | Assess published pages for quality            | "audit this page", "check docs quality"                 |
+| `docs-verifier` | Verify every claim and example against source | "verify this page", "fact-check the docs"               |
+| `docs-planner`  | Prioritize the docs backlog                   | "plan docs work", "what docs need writing"              |
 
 When authoring or reviewing documentation pages, follow the voice guide and the terminology lock. When verifying code examples in docs, follow the tiered procedure in `.agents/references/code-verification.md`.
 
@@ -61,10 +63,13 @@ When authoring or reviewing documentation pages, follow the voice guide and the 
 ├── AGENTS.md
 ├── CODE_OF_CONDUCT.md
 ├── CONTRIBUTING.md
+├── external-docs.config.json    # Upstream refs plus site-owned routes and navigation
+├── external-docs.lock.json      # Immutable upstream documentation revisions
 ├── SITE-ARCHITECTURE.md          # Detailed Astro/Starlight customizations
 ├── .build/
 │   ├── api-docs/                 # Generated Python and TypeScript API reference
-│   └── samples/pages/            # Generated sample guides (not committed)
+│   ├── external-docs/strands-box/ # Generated imported Box docs (not committed)
+│   └── samples/pages/             # Generated sample guides (not committed)
 ├── src/                          # Astro source files
 │   ├── components/               # Custom Astro components
 │   │   ├── CourseNotice.astro    # Course recording and example update notices
@@ -91,6 +96,7 @@ When authoring or reviewing documentation pages, follow the voice guide and the 
 │   │       ├── labs/
 │   │       ├── learning/         # Course lesson pages
 │   │       └── user-guide/
+│   │           └── box/source    # Symlink to .build/external-docs/strands-box/content
 │   ├── data/                     # Workflow-maintained catalog-stats.json (do not hand-edit)
 │   ├── layouts/                  # Custom layouts
 │   ├── pages/                    # Astro pages, including generated /examples routes
@@ -106,18 +112,20 @@ When authoring or reviewing documentation pages, follow the voice guide and the 
 ├── overrides/                    # Legacy MkDocs overrides (being migrated)
 ├── scripts/                      # Build and utility scripts
 │   ├── catalog/                  # Catalog stats refresh
+│   ├── external-docs/            # External Markdown import and lock updates
 │   └── samples/                  # Import samples metadata and guides at build time
 ├── test/                         # Test files
 └── test-snippets/                # TypeScript snippet test files
 ```
-### Directory Purposes
 
+### Directory Purposes
 
 **IMPORTANT**: After making changes that affect the directory structure (adding new directories, moving files, or adding significant new files), you MUST update this directory structure section to reflect the current state of the repository.
 
 ## Development Workflow for Agents
 
 ### 1. Environment Setup
+
 #### Prerequisites
 
 - Python 3.10+
@@ -186,7 +194,6 @@ For the underlying Astro/Starlight implementation (the snippets plugin, custom c
 1. **Read task requirements** carefully from the GitHub issue
 2. **Use existing patterns** as reference
 3. **Run quality checks** before committing
-
 
 ### Integration with Other Files
 
