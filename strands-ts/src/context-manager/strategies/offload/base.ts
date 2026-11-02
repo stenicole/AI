@@ -430,6 +430,9 @@ export abstract class BaseOffloadStrategy implements ContextStrategy {
     if (block instanceof ToolUseBlock) return false
     if (block instanceof CachePointBlock) return false
     if (block instanceof ReasoningBlock) return false
+    // Injected text is written after its message was stashed, so a ref to it would point at nothing,
+    // and its injector would only write it again.
+    if (block instanceof TextBlock && block.metadata?.injected !== undefined) return false
     if (block instanceof TextBlock) return targetMatchesMessage(this._target, message)
     if (block instanceof ToolResultBlock) {
       if (this._stash && toolNameMap.get(block.toolUseId) === RETRIEVAL_TOOL_NAME) return false

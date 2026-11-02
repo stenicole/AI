@@ -574,6 +574,19 @@ describe('Offload with * target (fires on everything)', () => {
 
     expect(result).toBe(false)
   })
+
+  it('leaves injected text in place', async () => {
+    const injected = new TextBlock('x'.repeat(2500 * 4 + 100), {
+      metadata: { injected: { source: 'strands:memory-manager' } },
+    })
+    const userMsg = new Message({ role: 'user', content: [new TextBlock('ask'), injected] })
+    const strategy = Offload.truncate('*', { previewTokens: 50 }).when({ threshold: 100 })
+
+    const result = await strategy.apply(makeContext([userMsg]))
+
+    expect(result).toBe(false)
+    expect(userMsg.content).toStrictEqual([new TextBlock('ask'), injected])
+  })
 })
 
 describe('Message-level drop vs truncate markers', () => {

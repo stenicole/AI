@@ -109,9 +109,11 @@ export async function summarizeContent(
 
 /**
  * Converts a block to what the summarizer accepts in a user turn: text, images, and documents pass
- * through, other content is rendered as text or a placeholder, and the rest is left out.
+ * through, other content is rendered as text or a placeholder, and the rest is left out. Injected text is
+ * left out too: its injector keeps that text current, and a copy in a summary would lose its marker.
  */
 function toSummarizerBlocks(block: ContentBlock | ToolResultContent): ContentBlock[] {
+  if (block instanceof TextBlock && block.metadata?.injected !== undefined) return []
   if (block instanceof TextBlock || block instanceof ImageBlock || block instanceof DocumentBlock) return [block]
   if (block instanceof JsonBlock) return [new TextBlock(JSON.stringify(block.json, null, 2))]
   if (block instanceof CitationsBlock) return block.content.map((content) => new TextBlock(content.text))
