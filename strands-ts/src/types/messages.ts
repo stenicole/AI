@@ -203,6 +203,8 @@ export type ContentBlock =
 
 /**
  * Marks text the SDK added to a user turn, such as recalled memories or a reminder, rather than the user's own words.
+ *
+ * @experimental
  */
 export interface InjectedBlockData {
   /**
@@ -213,6 +215,8 @@ export interface InjectedBlockData {
 
 /**
  * Metadata attached to a text block. Not sent to model providers.
+ *
+ * @experimental
  */
 export interface TextBlockMetadata {
   /**
