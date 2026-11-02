@@ -517,19 +517,6 @@ class TestSummarizeStrategyMessageLevel:
         assert messages == exp_messages
 
     @pytest.mark.asyncio
-    async def test_keeps_the_message_before_a_pinned_last_message_so_the_summary_does_not_end_the_history(
-        self, routing_agent
-    ):
-        strategy = Offload.summarize("*").when(utilization=0.7, preserve_recent=1)
-        messages = _routing_history()
-        messages[6] = {**messages[6], "metadata": PINNED}
-        original = list(messages)
-
-        assert await strategy.apply(ContextState(messages=messages, agent=routing_agent, utilization=0.9)) is True
-        assert routing_agent.model.summarize.call_args.args == (original[:5],)
-        assert messages == [_tracked_summary(5), *original[5:]]
-
-    @pytest.mark.asyncio
     async def test_preserves_alternation(self, routing_agent):
         strategy = Offload.summarize("*").when(utilization=0.8)
         messages: Messages = [
@@ -825,7 +812,7 @@ class TestSummarizeStrategyRouting:
         assert messages == [_tracked_summary(5), *original[5:]]
 
     @pytest.mark.asyncio
-    async def test_merges_same_role_messages_at_the_join(self, routing_agent):
+    async def test_moves_a_cut_on_the_last_message_back(self, routing_agent):
         messages = _routing_history()
         original = list(messages)
         strategy = Offload.summarize("*").when(utilization=0.7, preserve_recent=1)

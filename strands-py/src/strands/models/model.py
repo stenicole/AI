@@ -413,7 +413,9 @@ class Model(abc.ABC):
         opening messages: a non-empty prefix that starts with a user message, alternates roles, and keeps every
         ``toolUse`` with its ``toolResult``. It falls back to ``super().summarize()`` when native compaction is
         unavailable. Every other summary keeps message 0 verbatim; an override's prefix includes message 0, so a
-        fallback's summary replaces it.
+        fallback's summary replaces it. Replacing this method, by a subclass override or on the instance, is what opts
+        a model into replacing the conversation's start. A wrapper must replace it to forward an inner model's native
+        compaction, and should leave it alone when its summary would come from the base ``Model.summarize()``.
 
         Args:
             messages: The messages to summarize, left unmodified.

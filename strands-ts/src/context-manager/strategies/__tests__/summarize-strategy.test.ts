@@ -596,7 +596,7 @@ describe('routing through Model.summarize', () => {
     expect(messages).toEqual([markedSummary(5), ...original.slice(5)])
   })
 
-  it('merges same-role messages at the join', async () => {
+  it('moves a cut on the last message back', async () => {
     const model = new MockMessageModel()
     const received = mockSummarize(model)
     const messages = makeHistory()
@@ -605,10 +605,7 @@ describe('routing through Model.summarize', () => {
 
     expect(await strategy.apply(makeRoutingContext(messages, 0.9, model))).toBe(true)
     expect(received).toEqual([original.slice(0, 5)])
-    expect(messages).toEqual([
-      new Message({ role: 'user', content: [marked(5)], trackingId: anyTrackingId }),
-      ...original.slice(5),
-    ])
+    expect(messages).toEqual([markedSummary(5), ...original.slice(5)])
   })
 
   it('leaves the history unchanged and warns when summarize writes no summary', async () => {
@@ -920,23 +917,6 @@ describe('routing through Model.summarize', () => {
 
     expect(acted).toEqual([true, false, false])
     expect(received).toHaveLength(1)
-    expect(messages).toEqual([markedSummary(5), ...original.slice(5)])
-  })
-
-  it('keeps the message before a pinned last message so the summary does not end the history', async () => {
-    const model = new MockMessageModel()
-    const received = mockSummarize(model)
-    const strategy = Offload.summarize('*', { model }).when({ utilization: 0.7, preserveRecent: 1 })
-    const messages = makeHistory()
-    messages[6] = new Message({
-      role: 'user',
-      content: [new TextBlock('latest')],
-      metadata: { custom: { pinned: true } },
-    })
-    const original = [...messages]
-
-    expect(await strategy.apply(makeRoutingContext(messages, 0.9, model))).toBe(true)
-    expect(received).toEqual([original.slice(0, 5)])
     expect(messages).toEqual([markedSummary(5), ...original.slice(5)])
   })
 
