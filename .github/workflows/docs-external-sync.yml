@@ -1,4 +1,4 @@
-name: "Docs: Sync external lock"
+name: 'Docs: Sync external lock'
 
 on:
   schedule:
@@ -21,6 +21,15 @@ jobs:
       SYNC_BRANCH: docs/external-docs-sync
     steps:
       - uses: actions/checkout@v7
+
+      - name: Checkout samples
+        uses: actions/checkout@v7
+        with:
+          # Intentionally unpinned: validate the same latest samples input as publication builds.
+          repository: strands-agents/samples
+          path: samples-source
+          persist-credentials: false
+
       - uses: actions/setup-node@v7
         with:
           node-version-file: .node-version
@@ -48,16 +57,13 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Generate and validate external docs
-        if: steps.changes.outputs.changed == 'true'
-        working-directory: site
-        run: npm run external-docs:generate
-
       - name: Build the documentation site
         if: steps.changes.outputs.changed == 'true'
         working-directory: site
         env:
           NODE_OPTIONS: --max-old-space-size=4096
+          SAMPLES_SOURCE_DIR: ${{ github.workspace }}/samples-source
+          SAMPLES_REQUIRE_SOURCE: '1'
         run: npm run cms:build
 
       - name: Open or update the external docs lock PR
@@ -68,8 +74,8 @@ jobs:
           push-to-fork: strands-agent/harness-sdk
           add-paths: site/external-docs.lock.json
           branch: ${{ env.SYNC_BRANCH }}
-          title: "chore(docs): update external docs lock"
-          commit-message: "chore(docs): update external docs lock"
+          title: 'chore(docs): update external docs lock'
+          commit-message: 'chore(docs): update external docs lock'
           body: |
             Updates external documentation sources to the commits resolved from
             their configured upstream refs.

@@ -38,27 +38,39 @@ We're using [Astro](https://astro.build/) with the [Starlight](https://starlight
 
 **Pagination pruning for regular pages:** Starlight pre-computes prev/next links from the full sidebar before middleware runs. The middleware now prunes any links that fall outside the current nav section and overrides labels with actual page titles.
 
-### 3. MkDocs Snippets Plugin (`src/plugins/remark-mkdocs-snippets.ts`)
+### 3. Generated Sample Guides (`scripts/samples/`, `src/pages/examples/`)
+
+The build imports the samples repository's `samples.json` catalog and guide content into `.build/samples/pages`.
+
+- Set `SAMPLES_SOURCE_DIR` to a checkout of the samples repository.
+- Set `SAMPLES_REQUIRE_SOURCE=1` to fail when the source checkout is missing or has no samples. Without it, the build clears generated guides and renders the local setup message at `/examples/`.
+
+The importer warns when a guide links to a missing file and fails when a guide references a missing image.
+
+### 4. MkDocs Snippets Plugin (`src/plugins/remark-mkdocs-snippets.ts`)
 
 **What it does:** Processes MkDocs-style code snippet references in markdown files.
 
 **Why:** Our existing documentation uses MkDocs' snippet syntax to include code from external files. This plugin provides compatibility so we don't need to rewrite all our code examples.
 
 **Syntax supported:**
-```markdown
+
+````markdown
 ```typescript
 --8<-- "path/to/file.ts:section_name"
 ```
-```
+````
+
+````
 
 **Source file markers:**
 ```typescript
 // --8<-- [start:section_name]
 const example = "This code will be included"
 // --8<-- [end:section_name]
-```
+````
 
-### 4. Relative Link Resolution (`src/util/links.ts`, `src/components/PageLink.astro`)
+### 5. Relative Link Resolution (`src/util/links.ts`, `src/components/PageLink.astro`)
 
 **What it does:** Converts MkDocs-style relative file links to Astro slug-based URLs at render time.
 
@@ -75,6 +87,7 @@ const example = "This code will be included"
 **Example resolution:**
 
 From page `user-guide/concepts/agents/state.mdx`:
+
 - `conversation-management.md` → `/user-guide/concepts/agents/conversation-management/`
 - `../tools/custom-tools.md` → `/user-guide/concepts/tools/custom-tools/`
 - `../tools/index.md` → `/user-guide/concepts/tools/`
@@ -83,17 +96,20 @@ From page `user-guide/concepts/agents/state.mdx`:
 
 The collection base is `src/content` (not `src/content/docs`), so all doc slugs include a `docs/` prefix (e.g., `docs/user-guide/concepts/agents/state`). The `generateId` function strips this prefix from path-based slugs so that URLs remain clean (e.g., `/docs/user-guide/...`). Files with an explicit `slug` frontmatter field (such as generated API docs) use that value directly and must include the `docs/` prefix themselves.
 
-### 5. API Reference Links (`@api` shorthand)
+### 6. API Reference Links (`@api` shorthand)
 
 **What it does:** Provides a shorthand format for linking to API reference pages that's cleaner than relative paths.
 
 **Syntax:**
+
 ```markdown
 <!-- Python API -->
+
 [@api/python/strands.agent.agent](link text)
 [@api/python/strands.agent.agent#AgentResult](link text with anchor)
 
 <!-- TypeScript API -->
+
 [@api/typescript/Agent](link text)
 [@api/typescript/Agent#constructor](link text with anchor)
 ```
@@ -105,21 +121,25 @@ The collection base is `src/content` (not `src/content/docs`), so all doc slugs 
 3. `PageLink.astro` applies the site's base path for correct URL generation
 
 **Why use this format:**
+
 - Cleaner than relative paths with `../api-reference/python/...`
 - Doesn't break when the linking page moves to a different directory
 - Matches the actual URL structure of the generated API docs
 - Validated against the content collection at build time
 
 **Examples:**
+
 ```markdown
 <!-- Instead of this (fragile, verbose): -->
+
 [AgentResult](../api-reference/python/agent/agent_result.md#strands.agent.agent_result.AgentResult)
 
 <!-- Use this (clean, stable): -->
+
 [AgentResult](@api/python/strands.agent.agent_result#AgentResult)
 ```
 
-### 6. External Documentation Federation
+### 7. External Documentation Federation
 
 **What it does:** Imports versioned Markdown from product repositories into the Starlight
 content collection. The first integration publishes the Box manifest under
@@ -180,8 +200,9 @@ Preview pages set `pagefind: false` and `noindex, nofollow`. The sitemap and
 machine-readable documentation endpoints also omit them until the upstream product marks the
 manifest `stable`.
 
-Build and development scripts generate external docs before Astro starts. To preview changes
-from a local product checkout instead of the lock, set its source environment variable:
+Build and development scripts import sample guides and generate external docs before Astro
+starts. To preview changes from a local product checkout instead of the lock, set its source
+environment variable:
 
 ```bash
 EXTERNAL_DOCS_STRANDS_BOX_SOURCE=/path/to/box npm run dev
@@ -192,13 +213,13 @@ EXTERNAL_DOCS_STRANDS_BOX_SOURCE=/path/to/box npm run dev
 The main config ties everything together:
 
 ```javascript
-import { loadSidebarFromConfig } from "./src/sidebar.ts"
+import { loadSidebarFromConfig } from './src/sidebar.ts'
 import remarkMkdocsSnippets from './src/plugins/remark-mkdocs-snippets.ts'
 import AutoImport from 'astro-auto-import'
 
 const sidebar = loadSidebarFromConfig(
   path.resolve('./src/config/navigation.yml'),
-  path.resolve('./src/content')  // base is src/content, not src/content/docs
+  path.resolve('./src/content') // base is src/content, not src/content/docs
 )
 
 export default defineConfig({
@@ -214,10 +235,7 @@ export default defineConfig({
     starlight({
       markdown: {
         // Process generated docs through Starlight after following their content symlinks.
-        processedDirs: [
-          path.resolve('.build/api-docs'),
-          path.resolve('.build/external-docs'),
-        ],
+        processedDirs: [path.resolve('.build/api-docs'), path.resolve('.build/external-docs')],
       },
       sidebar: sidebar,
       routeMiddleware: './src/route-middleware.ts',
@@ -227,14 +245,15 @@ export default defineConfig({
       imports: [/* ... */],
       defaultComponents: {
         // Override anchor elements for relative link resolution
-        a: './src/components/PageLink.astro'
-      }
-    })
+        a: './src/components/PageLink.astro',
+      },
+    }),
   ],
 })
 ```
 
 Notable config details:
+
 - `themeCssSelector` on Expressive Code makes code block themes follow Starlight's `[data-theme]` attribute rather than the browser's `prefers-color-scheme`, keeping syntax highlighting in sync with the site's theme toggle.
 - `processedDirs` tells Starlight to run its rehype plugins (e.g. heading anchor links) on the real resolved paths of generated documentation symlinks.
 - `AutoImport` makes the following components available in every MDX page without an explicit import: `Tabs` (AutoSyncTabs), `Tab` (Starlight's TabItem), `Syntax`, and `YouTube` (from `@astro-community/astro-embed-youtube`).
@@ -300,7 +319,7 @@ Pages can display badges in sidebar navigation:
 ---
 title: My Page
 sidebar:
-  label: "AWS Lambda"
+  label: 'AWS Lambda'
   badge:
     text: New
     variant: note
@@ -316,7 +335,7 @@ Available variants: `note`, `tip`, `caution`, `danger`, `success`, `default`
 Documentation pages use MDX format and can import [Starlight components](https://starlight.astro.build/components/using-components/):
 
 ```mdx
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Tabs, TabItem } from '@astrojs/starlight/components'
 
 <Tabs>
   <TabItem label="Python">Python code here</TabItem>
@@ -332,6 +351,7 @@ We use [astro-auto-import](https://github.com/delucis/astro-auto-import) to make
 
 ```mdx
 <!-- No import needed — just use directly -->
+
 <Tabs>
   <Tab label="Python">pip install strands</Tab>
   <Tab label="TypeScript">npm install @strands-agents/sdk</Tab>
@@ -357,6 +377,7 @@ Pass <Syntax py="context_manager" ts="contextManager" /> to configure...
 ```
 
 Props:
+
 - `py` (required): Python syntax variant
 - `ts` (required): TypeScript syntax variant
 - `plain` (default: `false`): Renders as plain text instead of `<code>`.
@@ -387,6 +408,7 @@ These override default Starlight components:
 The custom sidebar components provide a flatter navigation style.
 
 **How it works:**
+
 1. Top-level groups render as non-collapsible section headers (uppercase labels), unless `collapsed: true` is set in `navigation.yml`, in which case they render as a collapsible with a caret icon
 2. Nested groups are collapsible with a caret icon
 3. Group labels link to their first child page (clickable navigation)
@@ -400,6 +422,7 @@ The custom sidebar components provide a flatter navigation style.
 The custom header (`src/components/overrides/Header.astro`) replicates the navigation tabs from the MkDocs Material theme used on strandsagents.com.
 
 **Features:**
+
 - Navigation tabs displayed below the main header row on desktop
 - Mobile dropdown menu next to the search bar for small screens
 - GitHub repository dropdown (`src/components/GitHubDropdown.astro`) replacing the default social icons
@@ -416,12 +439,12 @@ const rawNavLinks: NavLink[] = [
   {
     label: 'User Guide',
     href: '/user-guide/quickstart/overview/',
-    basePath: '/user-guide/',  // Used for active state detection
+    basePath: '/user-guide/', // Used for active state detection
   },
   {
     label: 'Contribute ❤️',
     href: 'https://github.com/strands-agents/harness-sdk/blob/main/CONTRIBUTING.md',
-    external: true,  // Opens in new tab with arrow icon
+    external: true, // Opens in new tab with arrow icon
   },
 ]
 ```
@@ -451,6 +474,7 @@ The Python API reference documentation is auto-generated from the SDK source cod
 **What it does:** Parses Python source code from the SDK and generates MDX documentation files.
 
 **How to run:**
+
 ```bash
 uv run scripts/api-generation-python.py
 ```
@@ -459,6 +483,7 @@ uv run scripts/api-generation-python.py
 **Output:** `.build/api-docs/python/*.mdx`
 
 **Filtering:**
+
 - Skips private modules (any module path containing `_` prefix)
 - Skips explicitly excluded modules (e.g., `strands.agent` which just re-exports)
 
@@ -467,6 +492,7 @@ uv run scripts/api-generation-python.py
 ### Symlink Setup
 
 The generated docs are accessed via a committed symlink:
+
 ```
 src/content/docs/api/python/_generated -> ../../../../../.build/api-docs/python
 ```
@@ -480,21 +506,25 @@ The index page (`src/content/docs/api/python/index.mdx`) is a permanent file (no
 **What it does:** Builds a hierarchical sidebar structure from Python API docs at runtime, and provides pagination utilities.
 
 **How it works:**
+
 1. Filters docs collection for `docs/api/python/*` pages
 2. Parses module names from page titles (e.g., `strands.agent.agent`)
 3. Builds a nested tree structure based on module path segments
 4. Converts tree to Starlight sidebar entries with groups and links
 
 **Pagination utilities:**
+
 - `flattenSidebar()` - Converts nested sidebar structure to a flat list of links
 - `getPrevNextLinks(sidebar, titlesByHref?)` - Finds the current page in the flattened sidebar and returns prev/next links. The optional `titlesByHref` map (href → title) overrides sidebar nav labels with actual page titles.
 
 **Sorting:**
+
 - Alphabetical A-Z within each level
 - "Experimental" group always appears last
 - Groups at depth ≥2 are collapsed by default
 
 **Example transformation:**
+
 ```
 strands.agent.agent      → Agent > Agent
 strands.agent.base       → Agent > Base
@@ -510,6 +540,7 @@ strands.bidi.types       → Bidi > Types
 ### Path Alias
 
 Components can be imported using the `@components` alias:
+
 ```typescript
 import PythonApiList from '@components/PythonApiList.astro'
 ```
@@ -525,6 +556,7 @@ The TypeScript API reference documentation is auto-generated from the SDK source
 **What it does:** Runs typedoc to generate markdown files, then post-processes them to add frontmatter.
 
 **How to run:**
+
 ```bash
 npm run sdk:generate:ts
 # or
@@ -537,6 +569,7 @@ npx tsx scripts/api-generation-typescript.ts
 ### TypeDoc Configuration (`typedoc.json`)
 
 Key settings:
+
 - `outputFileStrategy: "members"` - Creates separate files per class/interface/type/function
 - `fileExtension: ".md"` - Outputs standard markdown format
 - `basePath: ".build/sdk-typescript"` - Strips build path prefix from source links
@@ -548,18 +581,21 @@ Key settings:
 The generation script performs these transformations after typedoc runs:
 
 1. **Adds frontmatter** with title, slug, category, and `editUrl: false` (suppresses the "Edit this page" link since these files are generated):
+
    ```yaml
    ---
-   title: "Agent"
+   title: 'Agent'
    slug: docs/api/typescript/Agent
    category: classes
    editUrl: false
    ---
    ```
+
    For namespace members, the slug includes the namespace as a prefix separated by a colon:
+
    ```yaml
    ---
-   title: "setupTracer"
+   title: 'setupTracer'
    slug: docs/api/typescript/telemetry:setupTracer
    category: functions
    editUrl: false
@@ -575,6 +611,7 @@ The generation script performs these transformations after typedoc runs:
 ### Flat Slugs with Category Grouping
 
 Unlike Python API docs which use hierarchical slugs based on module paths, TypeScript API docs use flat slugs:
+
 - URL: `/docs/api/typescript/Agent/` (not `/docs/api/typescript/classes/Agent/`)
 - The `category` frontmatter field is used for sidebar grouping
 
@@ -591,6 +628,7 @@ When the SDK exports a namespace (e.g., `export * as telemetry from './telemetry
 ### Symlink Setup
 
 The generated docs are accessed via a committed symlink:
+
 ```
 src/content/docs/api/typescript/_generated -> ../../../../../.build/api-docs/typescript
 ```
@@ -602,12 +640,14 @@ The index page (`src/content/docs/api/typescript/index.mdx`) is a permanent file
 **What it does:** Builds a category-grouped sidebar structure from TypeScript API docs at runtime.
 
 **How it works:**
+
 1. Filters docs collection for `docs/api/typescript/*` pages
 2. Groups docs by their `category` frontmatter field
 3. Creates sidebar groups for Classes, Interfaces, Type Aliases, and Functions
 4. Sorts entries alphabetically within each group
 
 **Example structure:**
+
 ```
 Namespaces
   └── telemetry
@@ -637,6 +677,7 @@ Functions
 ### Content Collection Schema
 
 The `category` field is defined in `src/content.config.ts`:
+
 ```typescript
 extend: z.object({
   // ...
@@ -645,7 +686,6 @@ extend: z.object({
 ```
 
 This allows the content collection to validate and expose the category for sidebar generation.
-
 
 ## Custom Landing Page
 
@@ -656,11 +696,13 @@ The landing page uses a custom layout that provides the Starlight header without
 **What it does:** Provides a minimal layout with the Starlight header, theme support, and CSS variables, but without the sidebar, table of contents, or content constraints of documentation pages.
 
 **Key features:**
+
 - Mocks `Astro.locals.starlightRoute` with minimal data needed for the Header component
 - Mocks `Astro.locals.t` translation function (with `.all()` method for Search component)
 - Includes `SiteScripts` for Shortbread consent and WebSDK
 
 **Usage:**
+
 ```astro
 ---
 import LandingLayout from '../layouts/LandingLayout.astro'
@@ -674,6 +716,7 @@ import LandingLayout from '../layouts/LandingLayout.astro'
 ### Landing Page (`src/pages/index.astro`)
 
 The main landing page includes:
+
 - Animated parallax curves background (replicating strandsagents.com effect)
 - Hero section with frosted glass effect
 - Feature cards that expand on hover to show descriptions
@@ -681,6 +724,7 @@ The main landing page includes:
 - Footer with `Copyright` component (left-aligned, `--sl-color-bg-nav` background)
 
 **Assets:**
+
 - `src/assets/curve-primary.svg` and `src/assets/curve-secondary.svg` - Animated strand patterns
 - `src/assets/icons/icon-*.svg` - Feature card icons
 
@@ -693,13 +737,14 @@ Testimonials are managed as a content collection of Markdown files, with company
 ```typescript
 testimonials: defineCollection({
   loader: glob({ base: 'src/content', pattern: 'testimonials/**/*.md' }),
-  schema: ({ image }) => z.object({
-    name: z.string(),
-    title: z.string().optional(),
-    logo: image().optional(),       // Light-mode company logo
-    dark_logo: image().optional(),  // Dark-mode variant (falls back to logo)
-    order: z.number().default(0),
-  }),
+  schema: ({ image }) =>
+    z.object({
+      name: z.string(),
+      title: z.string().optional(),
+      logo: image().optional(), // Light-mode company logo
+      dark_logo: image().optional(), // Dark-mode variant (falls back to logo)
+      order: z.number().default(0),
+    }),
 })
 ```
 
@@ -742,9 +787,15 @@ The `order` field controls display sequence in the slider. Logo paths are relati
 The landing page renders both `logo` and `dark_logo` (falling back to `logo` when no dark variant exists) and uses CSS to show the appropriate one based on Starlight's `[data-theme]` attribute:
 
 ```css
-.logo-dark { display: none; }
-[data-theme='dark'] .logo-light { display: none; }
-[data-theme='dark'] .logo-dark { display: block; }
+.logo-dark {
+  display: none;
+}
+[data-theme='dark'] .logo-light {
+  display: none;
+}
+[data-theme='dark'] .logo-dark {
+  display: block;
+}
 ```
 
 ## Temporary Migration Files
@@ -765,7 +816,6 @@ These scripts assist with documentation maintenance:
 - `scripts/update-quickstart.ts` - Quickstart-specific transformations
 - `scripts/update-language-index.ts` - Updates language index pages
 - `test/update-docs.test.ts` - Tests for API link conversion utilities
-
 
 ## URL Redirects (Old MkDocs URLs → New CMS URLs)
 
@@ -808,6 +858,7 @@ Edit `SLUG_RULES` in `src/util/redirect.ts` for structural renames affecting man
 ```
 
 Helper builders from `src/util/regex.ts`:
+
 - `startsWith(prefix)` — matches slugs starting with `prefix/`, captures the rest in `m[1]`
 - `exactly(s)` — matches the slug exactly
 
@@ -822,6 +873,7 @@ Helper builders from `src/util/regex.ts`:
   - Live sitemap coverage (controlled by `VERIFY_LIVE_SITEMAP=true`, skipped locally).
 
 Run with:
+
 ```bash
 npm test
 ```
@@ -835,6 +887,7 @@ We provide machine-readable documentation following the [llms.txt specification]
 ### Why Custom Implementation
 
 We evaluated existing Astro llms.txt plugins/integrations but found them lacking:
+
 - They generated HTML or poorly formatted markdown with navigation clutter
 - Links weren't properly resolved to our documentation structure
 - No support for our custom components (tabs, code snippets, etc.)
@@ -843,19 +896,21 @@ Our implementation renders documentation through Astro's container API, applies 
 
 ### Endpoints
 
-- `/llms.txt` - Index with links to all docs organized by sidebar structure
-- `/llms-full.txt` - Complete documentation content (excludes API reference)
+- `/llms.txt` - Index with links to docs, generated sample guides, blog posts, and changelog entries
+- `/llms-full.txt` - Complete docs, generated sample guide, and blog content (excludes API reference)
 - `/{slug}/index.md` - Any doc page in raw markdown format
+- `/examples/{sample}/index.md` - Any generated sample guide in raw markdown format
 
 ### Implementation Files
 
-| File | Purpose |
-|------|---------|
-| `src/pages/llms.txt.ts` | Generates index from sidebar structure |
-| `src/pages/llms-full.txt.ts` | Renders all docs inline |
-| `src/pages/[...slug]/index.md.ts` | Dynamic endpoint for individual pages |
-| `src/util/render-to-markdown.ts` | Renders MDX entries via AstroContainer |
-| `src/util/html-to-markdown.ts` | HTML→Markdown conversion with custom rules |
+| File                                         | Purpose                                      |
+| -------------------------------------------- | -------------------------------------------- |
+| `src/pages/llms.txt.ts`                      | Generates index from sidebar structure       |
+| `src/pages/llms-full.txt.ts`                 | Renders all docs inline                      |
+| `src/pages/[...slug]/index.md.ts`            | Dynamic endpoint for individual pages        |
+| `src/pages/examples/[...sample]/index.md.ts` | Dynamic endpoint for generated sample guides |
+| `src/util/render-to-markdown.ts`             | Renders MDX entries via AstroContainer       |
+| `src/util/html-to-markdown.ts`               | HTML→Markdown conversion with custom rules   |
 
 ### HTML-to-Markdown Transformations
 
@@ -870,6 +925,7 @@ Uses [Turndown](https://github.com/mixmark-io/turndown) with custom rules:
 ### Link Handling
 
 The `src/util/links.ts` module was extended:
+
 - `toRawMarkdownUrl()` - Converts paths to index.md URLs, skips files with extensions
 - `isLocalLink()` - Identifies links that should be converted (excludes .txt, external, anchors)
 - `resolveHref()` - Special-cases `llms.txt` and `llms-full.txt` for proper resolution
@@ -894,6 +950,7 @@ The blog is a standalone section at `/blog/` with its own content collection, la
 ### Content Collections
 
 **Authors** (`src/content/authors.yaml`):
+
 ```yaml
 - id: strands-team
   name: Strands Agents Team
@@ -904,15 +961,16 @@ The blog is a standalone section at `/blog/` with its own content collection, la
 Schema: `{ id, name, role, bio, avatar? }` — all strings. The `id` field is used as the reference key from blog post frontmatter. Stored as a single YAML file (array of author objects) rather than individual JSON files per author.
 
 **Blog Posts** (`src/content/blog/*.mdx`):
+
 ```yaml
 ---
-title: "Post Title"
+title: 'Post Title'
 date: 2026-02-20T00:00:00.000Z
-description: "Short description for cards and meta tags."
-authors: ["strands-team"]     # References author file IDs
-tags: ["Open Source"]
-draft: false                  # Excluded from production builds
-coverImage: "/path/to/image"  # Optional
+description: 'Short description for cards and meta tags.'
+authors: ['strands-team'] # References author file IDs
+tags: ['Open Source']
+draft: false # Excluded from production builds
+coverImage: '/path/to/image' # Optional
 ---
 ```
 
@@ -930,15 +988,15 @@ Dependencies: `reading-time`, `mdast-util-to-string`.
 
 Helper functions used across all blog pages:
 
-| Function | Purpose |
-|----------|---------|
-| `getPublishedPosts()` | All posts sorted by date desc, excludes drafts in prod |
-| `getAllTags()` | Unique tags across all published posts |
-| `getPostsByTag(tag)` | Posts filtered by tag |
-| `getPostsByAuthor(authorId)` | Posts filtered by author ID |
-| `resolveAuthors(ids)` | Looks up author collection entries by ID |
-| `tagToSlug(tag)` / `slugToTag(slug)` | Bidirectional tag↔URL conversion |
-| `formatDate(date)` | Human-readable date (e.g., "February 20, 2026") |
+| Function                             | Purpose                                                |
+| ------------------------------------ | ------------------------------------------------------ |
+| `getPublishedPosts()`                | All posts sorted by date desc, excludes drafts in prod |
+| `getAllTags()`                       | Unique tags across all published posts                 |
+| `getPostsByTag(tag)`                 | Posts filtered by tag                                  |
+| `getPostsByAuthor(authorId)`         | Posts filtered by author ID                            |
+| `resolveAuthors(ids)`                | Looks up author collection entries by ID               |
+| `tagToSlug(tag)` / `slugToTag(slug)` | Bidirectional tag↔URL conversion                       |
+| `formatDate(date)`                   | Human-readable date (e.g., "February 20, 2026")        |
 
 ### Layouts
 
@@ -948,36 +1006,38 @@ Helper functions used across all blog pages:
 
 ### Components (`src/components/blog/`)
 
-| Component | Purpose |
-|-----------|---------|
-| `BlogCard.astro` | Card for listing pages (cover, title, description, meta, tags). Glassmorphism styling matching landing page. |
-| `BlogAuthorByline.astro` | Author avatar + name + role, links to `/blog/authors/[id]/` |
-| `BlogTagList.astro` | Tag chips linking to `/blog/tags/[tagSlug]/` |
-| `BlogPostGrid.astro` | Reusable card grid (auto-fill, 320px min, 1200px max). Resolves authors for all posts. |
+| Component                | Purpose                                                                                                      |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `BlogCard.astro`         | Card for listing pages (cover, title, description, meta, tags). Glassmorphism styling matching landing page. |
+| `BlogAuthorByline.astro` | Author avatar + name + role, links to `/blog/authors/[id]/`                                                  |
+| `BlogTagList.astro`      | Tag chips linking to `/blog/tags/[tagSlug]/`                                                                 |
+| `BlogPostGrid.astro`     | Reusable card grid (auto-fill, 320px min, 1200px max). Resolves authors for all posts.                       |
 
 ### Pages
 
-| Route | File | Description |
-|-------|------|-------------|
-| `/blog/` | `src/pages/blog/index.astro` | Index with tag filter bar + post grid |
-| `/blog/[slug]` | `src/pages/blog/[slug].astro` | Individual post (via `getStaticPaths`) |
-| `/blog/tags/[tag]/` | `src/pages/blog/tags/[tag].astro` | Posts filtered by tag |
-| `/blog/authors/[author]/` | `src/pages/blog/authors/[author].astro` | Author page with bio + their posts |
+| Route                     | File                                    | Description                            |
+| ------------------------- | --------------------------------------- | -------------------------------------- |
+| `/blog/`                  | `src/pages/blog/index.astro`            | Index with tag filter bar + post grid  |
+| `/blog/[slug]`            | `src/pages/blog/[slug].astro`           | Individual post (via `getStaticPaths`) |
+| `/blog/tags/[tag]/`       | `src/pages/blog/tags/[tag].astro`       | Posts filtered by tag                  |
+| `/blog/authors/[author]/` | `src/pages/blog/authors/[author].astro` | Author page with bio + their posts     |
 
 ### Navigation
 
 Blog is added to the header nav in `src/config/navbar.ts`:
+
 ```typescript
 { label: 'Blog', href: '/blog/', basePath: '/blog/' }
 ```
+
 Active state is handled by the existing `findCurrentNavSection()` longest-match logic.
 
 ### RSS Feeds
 
-| Endpoint | File |
-|----------|------|
-| `/blog/feed.xml` | `src/pages/blog/feed.xml.ts` — Main feed (all posts) |
-| `/blog/feed/[tag].xml` | `src/pages/blog/feed/[tag].xml.ts` — Per-tag feeds |
+| Endpoint               | File                                                 |
+| ---------------------- | ---------------------------------------------------- |
+| `/blog/feed.xml`       | `src/pages/blog/feed.xml.ts` — Main feed (all posts) |
+| `/blog/feed/[tag].xml` | `src/pages/blog/feed/[tag].xml.ts` — Per-tag feeds   |
 
 Uses `@astrojs/rss`. Currently includes description only (not full rendered content).
 
@@ -993,6 +1053,7 @@ The blog extends the existing llms.txt system:
 ### OG Images
 
 Build-time OG image generation with `satori` + `@resvg/resvg-js`, shared by the site-wide default (`/og-image.png`) and per-post cards (`/blog/og/[slug].png`):
+
 - 1200×630px images from a title + description
 - Strands branding: dark green-to-black gradient, halftone dot field, wordmark, and frog mark
 
