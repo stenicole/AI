@@ -551,6 +551,9 @@ describe('GoogleModel', () => {
       await expect(collectIterator(provider.stream(messages))).rejects.toThrow(ModelThrottledError)
     })
 
+    // #5744
+    const midStreamMessage =
+      'got status: RESOURCE_EXHAUSTED. {"error":{"code":429,"message":"Resource exhausted","status":"RESOURCE_EXHAUSTED"}}'
     it.each([
       [
         'an ApiError with a non-JSON body wrapped by @google/genai',
@@ -559,7 +562,11 @@ describe('GoogleModel', () => {
           status: 429,
         }),
       ],
-      ['an ApiError with a non-JSON message', new ApiError({ message: 'Too Many Requests', status: 429 })],
+      ['a mid-stream ApiError', new ApiError({ message: midStreamMessage, status: 429 })],
+      [
+        'a mid-stream ApiError from another @google/genai module copy',
+        Object.assign(new Error(midStreamMessage), { name: 'ApiError', status: 429 }),
+      ],
       [
         'an error whose JSON message carries code 429',
         new Error(JSON.stringify({ error: { message: 'Rate limited', code: 429, status: 'Too Many Requests' } })),
@@ -576,7 +583,10 @@ describe('GoogleModel', () => {
       const provider = new GoogleModel({ client: mockClient })
       const messages = [new Message({ role: 'user', content: [new TextBlock('Hi')] })]
 
-      await expect(collectIterator(provider.stream(messages))).rejects.toThrow(ModelThrottledError)
+      await expect(collectIterator(provider.stream(messages))).rejects.toMatchObject({
+        name: 'ModelThrottledError',
+        cause: error,
+      })
     })
 
     it('rethrows unrecognized errors', async () => {

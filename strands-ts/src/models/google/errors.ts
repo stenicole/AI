@@ -4,7 +4,6 @@
  * @internal This module is not part of the public API.
  */
 
-import { ApiError } from '@google/genai'
 import { logger } from '../../logging/logger.js'
 
 /**
@@ -52,8 +51,9 @@ export const ERROR_STATUS_MAP: Record<string, ErrorStatusConfig> = {
  * @internal
  */
 export function classifyGoogleError(error: Error): GoogleErrorType | undefined {
-  // A non-JSON 429 body gets the HTTP reason phrase as its status, so the code is the reliable signal.
-  if (error instanceof ApiError && error.status === 429) {
+  // A 429 can arrive with a non-JSON message or a reason-phrase status, so the HTTP code is the reliable signal.
+  // Checked by shape because instanceof fails across the @google/genai ESM and CJS builds.
+  if (error.name === 'ApiError' && 'status' in error && error.status === 429) {
     return 'throttling'
   }
 
