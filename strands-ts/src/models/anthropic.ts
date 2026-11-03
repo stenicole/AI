@@ -12,6 +12,14 @@ import {
 } from '../models/model.js'
 import { THINKING_BINDING_BETA, isThinkingBindingError, thinkingWithDropBlock } from './thinking-binding.js'
 import {
+  COMPACTION_BETA,
+  carriesNativeBlock,
+  compactionParams,
+  formatTextBlock,
+  readCompaction,
+} from './anthropic-compaction.js'
+import type { SummaryRequest, SummaryResult } from './summary.js'
+import {
   handleRejectedMechanism,
   structuredOutputMechanisms,
   toNativeOutputSchema,
@@ -145,6 +153,25 @@ function headerBetas(headers: ClientOptions['defaultHeaders']): string[] {
     .flatMap(([, value]) => (Array.isArray(value) ? value : [value]))
     .filter((value): value is string => typeof value === 'string')
     .flatMap((value) => value.split(',').flatMap((beta) => beta.trim() || []))
+}
+
+/** Maps a vendor error to the SDK's typed errors, keeping the original as the cause. */
+function translateError(unknownError: unknown): Error {
+  const error = normalizeError(unknownError)
+
+  const lowered = error.message.toLowerCase()
+  if (CONTEXT_WINDOW_OVERFLOW_ERRORS.some((msg) => lowered.includes(msg))) {
+    return new ContextWindowOverflowError(error.message)
+  }
+
+  const err = unknownError as Error & { status?: number }
+  if (err.status === 429) {
+    const message = error.message ?? 'Request was throttled by the model provider'
+    logger.debug(`throttled | error_message=<${message}>`)
+    return new ModelThrottledError(message, { cause: err })
+  }
+
+  return error
 }
 
 export interface AnthropicModelConfig extends BaseModelConfig {
@@ -291,7 +318,7 @@ export class AnthropicModel extends Model<AnthropicModelConfig> {
         ...(request.tool_choice && { tool_choice: request.tool_choice }),
       }
 
-      const requestOptions = this._buildRequestOptions()
+      const requestOptions = this._buildRequestOptions(messages)
       const response = requestOptions
         ? await this._client.messages.countTokens(params, requestOptions)
         : await this._client.messages.countTokens(params)
@@ -325,7 +352,7 @@ export class AnthropicModel extends Model<AnthropicModelConfig> {
         options
       )
       thinking = request.thinking
-      const requestOptions = this._buildRequestOptions()
+      const requestOptions = this._buildRequestOptions(messages)
       const usage = createEmptyUsage()
 
       while (true) {
@@ -522,21 +549,41 @@ export class AnthropicModel extends Model<AnthropicModelConfig> {
         return
       }
 
-      const error = normalizeError(unknownError)
+      throw translateError(unknownError)
+    }
+  }
 
-      const lowered = error.message.toLowerCase()
-      if (CONTEXT_WINDOW_OVERFLOW_ERRORS.some((msg) => lowered.includes(msg))) {
-        throw new ContextWindowOverflowError(error.message)
-      }
-
-      const err = unknownError as Error & { status?: number }
-      if (err.status === 429) {
-        const message = error.message ?? 'Request was throttled by the model provider'
-        logger.debug(`throttled | error_message=<${message}>`)
-        throw new ModelThrottledError(message, { cause: err })
-      }
-
-      throw error
+  /**
+   * Summarizes `request.messages` with Anthropic on-demand compaction (beta `compact-2026-09-04`), sending the live
+   * system prompt and tools unchanged. The returned compaction block is stored as a {@link TextBlock} whose `text` is
+   * the summary and whose `providerData` holds every other field of the block, so it is sent back exactly as
+   * returned.
+   *
+   * Called only when `modelInfo.capabilities.serverSideCompaction` is `true`, which `AnthropicModel` leaves unknown
+   * unless set through the `modelInfo` config.
+   *
+   * @param request - The messages to summarize, the live system prompt and tools, and optional instructions
+   * @returns The summary, or `undefined` when the response holds none (`stop_reason` other than `compaction`)
+   * @throws ContextWindowOverflowError when the request does not fit the context window
+   * @throws ModelThrottledError when the request is throttled
+   */
+  override async compact(request: SummaryRequest): Promise<SummaryResult | undefined> {
+    try {
+      const params = compactionParams(
+        this._formatRequest(request.messages, {
+          ...(request.systemPrompt !== undefined && { systemPrompt: request.systemPrompt }),
+          ...(request.toolSpecs !== undefined && { toolSpecs: request.toolSpecs }),
+        }),
+        request.instructions
+      )
+      const options = this._buildRequestOptions(request.messages, true)
+      // The beta stream keeps `usage.iterations`, where a compaction response reports its usage.
+      const response = await this._client.beta.messages
+        .stream(params, { ...options, ...(request.cancelSignal && { signal: request.cancelSignal }) })
+        .finalMessage()
+      return readCompaction(response, this._config.modelId)
+    } catch (unknownError) {
+      throw translateError(unknownError)
     }
   }
 
@@ -563,13 +610,15 @@ export class AnthropicModel extends Model<AnthropicModelConfig> {
     return handleRejectedMechanism('anthropic', modelId, mechanism, schema, apiErrorMessage(error))
   }
 
-  private _buildRequestOptions(): Anthropic.RequestOptions | undefined {
+  private _buildRequestOptions(messages: Message[] = [], compacting = false): Anthropic.RequestOptions | undefined {
+    const required = [
+      ...(this._dropsStaleThinking() ? [THINKING_BINDING_BETA] : []),
+      ...(compacting || carriesNativeBlock(messages) ? [COMPACTION_BETA] : []),
+    ]
     let betas = this._config.betas ?? []
-    if (this._dropsStaleThinking()) {
-      // Request headers replace client headers of the same name, so betas set on the client are carried over.
-      if (betas.length === 0) betas = this._clientBetas
-      if (!betas.includes(THINKING_BINDING_BETA)) betas = [...betas, THINKING_BINDING_BETA]
-    }
+    // Request headers replace client headers of the same name, so betas set on the client are carried over.
+    if (required.length > 0 && betas.length === 0) betas = this._clientBetas
+    betas = [...betas, ...required.filter((beta) => !betas.includes(beta))]
     if (betas.length === 0) return undefined
     return { headers: { 'anthropic-beta': betas.join(',') } }
   }
@@ -845,7 +894,7 @@ export class AnthropicModel extends Model<AnthropicModelConfig> {
   ): Anthropic.ContentBlockParam | Anthropic.ToolResultBlockParam | undefined {
     switch (block.type) {
       case 'textBlock':
-        return { type: 'text', text: block.text }
+        return formatTextBlock(block)
 
       case 'imageBlock': {
         const imgBlock = block as ImageBlock

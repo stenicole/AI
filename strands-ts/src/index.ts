@@ -67,6 +67,10 @@ export type {
   Role,
   StopReason,
   TextBlockData,
+  TextBlockMetadata,
+  OffloadedBlockData,
+  OffloadMethod,
+  ProviderData,
   ToolUseBlockData,
   ToolResultBlockData,
   ReasoningBlockData,
@@ -199,6 +203,7 @@ export {
 
 // Model provider types
 export type { BaseModelConfig, CountTokensOptions, StreamOptions, CacheConfig } from './models/model.js'
+export type { SummaryRequest, SummaryResult } from './models/summary.js'
 export type { ModelInfo, ModelCapabilities, ModelLimits, PromptCaching } from './models/model-info.js'
 
 export { Model } from './models/model.js'

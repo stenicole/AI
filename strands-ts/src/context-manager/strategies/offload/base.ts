@@ -145,6 +145,17 @@ export function messageMatchesTarget(
 }
 
 /**
+ * Resolves `preserveRecent` to a message count.
+ *
+ * @param total - Number of messages the count applies to
+ * @param preserveRecent - Integer (1 or above): absolute count. Decimal (between 0 and 1 exclusive): ratio of `total`, rounded up.
+ * @returns How many of the most recent messages to keep
+ */
+export function resolvePreserveCount(total: number, preserveRecent: number): number {
+  return preserveRecent > 0 && preserveRecent < 1 ? Math.ceil(total * preserveRecent) : Math.floor(preserveRecent)
+}
+
+/**
  * Returns target-matching messages excluding the most recent matches.
  * First filters to only messages that match the target, then removes the tail.
  *
@@ -161,8 +172,7 @@ export function getOldestMatches(
   const matching = messages.filter((message) =>
     messageMatchesTarget(message, target, toolNameMap, toolIncludeFilter, toolExcludeFilter)
   )
-  const count =
-    preserveRecent > 0 && preserveRecent < 1 ? Math.ceil(matching.length * preserveRecent) : Math.floor(preserveRecent)
+  const count = resolvePreserveCount(matching.length, preserveRecent)
   if (count >= matching.length) return []
   return matching.slice(0, -count)
 }
@@ -430,7 +440,8 @@ export abstract class BaseOffloadStrategy implements ContextStrategy {
     if (block instanceof ToolUseBlock) return false
     if (block instanceof CachePointBlock) return false
     if (block instanceof ReasoningBlock) return false
-    if (block instanceof TextBlock) return targetMatchesMessage(this._target, message)
+    // Provider data is signed over the block as returned, so an in-place edit would invalidate it.
+    if (block instanceof TextBlock) return !block.providerData && targetMatchesMessage(this._target, message)
     if (block instanceof ToolResultBlock) {
       if (this._stash && toolNameMap.get(block.toolUseId) === RETRIEVAL_TOOL_NAME) return false
       return (
