@@ -4,6 +4,8 @@ import type { MessageData } from '../../types/messages.js'
 import { addInjection, isUserTurn, resolveTrigger } from '../message-injection.js'
 import type { InjectionContext, InjectionOptions } from '../types.js'
 import { Agent } from '../../agent/agent.js'
+import type { AgentConfig } from '../../agent/agent.js'
+import { Offload } from '../../context-manager/strategies/offload/index.js'
 import { AfterModelCallEvent, BeforeModelCallEvent, MessageAddedEvent } from '../../hooks/events.js'
 import { MockMessageModel } from '../../__fixtures__/mock-message-model.js'
 import { createMockTool } from '../../__fixtures__/tool-helpers.js'
@@ -76,8 +78,13 @@ describe('resolveTrigger', () => {
 
 describe('addInjection', () => {
   /** An agent with one injection and a record of the messages each model call received. */
-  function setup(model: MockMessageModel, options: Omit<InjectionOptions, 'source'>, tools: Tool[] = []) {
-    const agent = new Agent({ model, printer: false, tools })
+  function setup(
+    model: MockMessageModel,
+    options: Omit<InjectionOptions, 'source'>,
+    tools: Tool[] = [],
+    config: Pick<AgentConfig, 'contextManager'> = {}
+  ) {
+    const agent = new Agent({ model, printer: false, tools, ...config })
     addInjection(agent, { source: 'test', ...options })
     const requests: MessageData[][] = []
     const originalStream = model.stream.bind(model)
@@ -186,6 +193,26 @@ describe('addInjection', () => {
     expect(injectedBlocks).toStrictEqual([injected('\n\ncwd: /repo'), injected('\n\ncwd: /other')])
     expect(agent.messages[2]!.content).toStrictEqual([new TextBlock('second')])
     expectEachRequestExtendsThePrevious(requests)
+  })
+
+  it('keeps every request a prefix of the next when a context manager offloads large blocks', async () => {
+    const text = `<agents_md>${'Keep functions small. '.repeat(40)}</agents_md>`
+    const model = new MockMessageModel()
+      .addTurn({ type: 'textBlock', text: 'one' })
+      .addTurn({ type: 'textBlock', text: 'two' })
+      .addTurn({ type: 'textBlock', text: 'three' })
+    const { agent, requests } = setup(model, { renderContent: async () => text }, [], {
+      contextManager: { strategies: [Offload.summarize('*').when({ threshold: 20 })] },
+    })
+
+    await agent.invoke('first')
+    await agent.invoke('second')
+    await agent.invoke('third')
+
+    // Three requests means the summarizer never ran on the injected block.
+    expect(requests).toHaveLength(3)
+    expectEachRequestExtendsThePrevious(requests)
+    expect(agent.messages[0]!.content).toStrictEqual([new TextBlock('first'), injected(`\n\n${text}`)])
   })
 
   it('writes into a message once, so a retry resends the same request even when the text changes', async () => {
