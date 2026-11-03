@@ -34,6 +34,20 @@ describe('flattenMessagesToContent', () => {
     expect(flattenMessagesToContent(messages)).toEqual([new TextBlock('\n---\n[user]'), new TextBlock('next')])
   })
 
+  it('leaves out injected text', () => {
+    const messages = [
+      new Message({
+        role: 'user',
+        content: [
+          new TextBlock('fix the build'),
+          new TextBlock('\n\n<todos>v1</todos>', { metadata: { injected: { source: 'strands:todos:injector' } } }),
+        ],
+      }),
+    ]
+
+    expect(flattenMessagesToContent(messages)).toEqual([new TextBlock('\n---\n[user]'), new TextBlock('fix the build')])
+  })
+
   it('passes only text, images, and documents through and renders other blocks as text', () => {
     const bytes = new Uint8Array([1])
     const image = new ImageBlock({ format: 'png', source: { bytes } })

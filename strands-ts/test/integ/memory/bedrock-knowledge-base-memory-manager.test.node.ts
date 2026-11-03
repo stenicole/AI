@@ -3,7 +3,7 @@ import { BedrockAgentClient, DeleteKnowledgeBaseDocumentsCommand } from '@aws-sd
 import { BedrockAgentRuntimeClient } from '@aws-sdk/client-bedrock-agent-runtime'
 import { fromNodeProviderChain } from '@aws-sdk/credential-providers'
 
-import { Agent, MemoryManager, InvocationTrigger, IntervalTrigger, InvokeModelStage } from '$/sdk/index.js'
+import { Agent, MemoryManager, InvocationTrigger, IntervalTrigger, InvokeModelStage, TextBlock } from '$/sdk/index.js'
 import type { Message } from '$/sdk/index.js'
 import type { ExtractionConfig } from '$/sdk/memory/extraction/types.js'
 import { BedrockKnowledgeBaseStore } from '$/sdk/vended-memory-stores/bedrock-knowledge-base/index.js'
@@ -142,10 +142,9 @@ describe('BedrockKnowledgeBaseStore MemoryManager E2E', () => {
   }
 
   /**
-   * Registers an observer on the InvokeModelStage input phase AFTER the agent initializes, so it runs
-   * after the manager's injection middleware (input handlers compose in registration order, each
-   * seeing the prior's output). Returns a getter for the messages the model last saw — i.e. the
-   * ephemeral, post-injection input — without depending on the model's response.
+   * Registers an observer on the InvokeModelStage input phase. The manager writes injected text into the
+   * conversation before the model call, so the observer sees it. Returns a getter for the messages the
+   * model last saw, without depending on the model's response.
    */
   async function observeModelInput(agent: Agent): Promise<() => readonly Message[] | undefined> {
     await agent.initialize()
@@ -254,12 +253,12 @@ describe('BedrockKnowledgeBaseStore MemoryManager E2E', () => {
   })
 
   // ---------------------------------------------------------------------------
-  // Injection — retrieved memory folded into the model input ephemerally (NOT the search tool).
+  // Injection — retrieved memory written into the prompt message (NOT the search tool).
   // searchToolConfig: false so the ONLY path to the seeded fact is auto-injection.
   // ---------------------------------------------------------------------------
 
   describe.skipIf(shouldSkip())('injection', () => {
-    it('folds a <memory> block into the model input and never touches durable history', async () => {
+    it('writes a <memory> block into the prompt message, marked injected', async () => {
       const store = makeStore('integ-mm-inject')
       const fact = willowFact()
       await seedFact(store, fact.text)
@@ -272,7 +271,7 @@ describe('BedrockKnowledgeBaseStore MemoryManager E2E', () => {
       const prompt = 'What botanical tag does the weeping willow in the meditation garden carry?'
       const result = await agent.invoke(prompt)
 
-      // 1. The model input carried the injected memory (ephemeral fold into the latest user message).
+      // 1. The model input carried the injected memory.
       const seen = getSeen()
       expect(seen).toBeDefined()
       const injectedText = seen!.map((m) => getMessageText(m)).join('\n')
@@ -280,12 +279,13 @@ describe('BedrockKnowledgeBaseStore MemoryManager E2E', () => {
       expect(injectedText).toContain(`source="${store.name}"`)
       expect(injectedText).toContain(fact.answer)
 
-      // 2. Durable history is untouched: the stored user message is byte-identical to the original
-      //    prompt (injection folds into the per-call copy only, never agent.messages), and the search
-      //    tool was never used (it's disabled) — proving the answer came from injection, not a tool.
+      // 2. The stored user message is the prompt plus one block marked as the manager's, and the search
+      //    tool was never used (it's disabled), proving the answer came from injection, not a tool.
       const firstUserMessage = agent.messages.find((m) => m.role === 'user')
-      expect(firstUserMessage).toBeDefined()
-      expect(getMessageText(firstUserMessage!)).toBe(prompt)
+      expect(firstUserMessage?.content).toStrictEqual([
+        new TextBlock(prompt),
+        new TextBlock(expect.stringContaining(fact.answer), { metadata: { injected: { source: memoryManager.name } } }),
+      ])
       expect(hasToolUse(agent.messages, SEARCH_TOOL)).toBe(false)
 
       // 3. The model actually used the injected fact (the unique tag can't be guessed).
@@ -324,7 +324,7 @@ describe('BedrockKnowledgeBaseStore MemoryManager E2E', () => {
 
   // ---------------------------------------------------------------------------
   // search_memory tool — explicit, model-driven retrieval. Injection is disabled so the only path to
-  // the fact is the tool: injection is on by default and would otherwise fold the seeded fact into
+  // the fact is the tool: injection is on by default and would otherwise write the seeded fact into
   // the prompt, letting a correct answer bypass the tool.
   // ---------------------------------------------------------------------------
 

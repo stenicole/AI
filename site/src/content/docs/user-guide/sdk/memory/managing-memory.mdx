@@ -131,7 +131,26 @@ agent = Agent(
 
 Injection searches memory before a model call and folds the top results into the prompt, so relevant knowledge is present on every turn. It is **on by default**: the manager injects on a fresh user turn, retrieves up to 5 entries, derives the query adaptively from the latest user message, and renders the results as a `<memory>` block. Turn it off by disabling the injection config.
 
-The injected text is **ephemeral by design**: it augments the model input for a single call and never persists into the durable conversation or session.
+Whether the injected text stays in the conversation depends on the SDK:
+
+<Tabs>
+<Tab label="Python">
+
+The text augments the model input for a single call and never persists into the
+conversation or session.
+</Tab>
+<Tab label="TypeScript">
+
+The manager writes the text into the latest user message as a text block with
+`metadata.injected` set, and the text stays in the conversation and the session. Automatic
+extraction skips that text, so recalled memories aren't extracted from it again. The
+manager writes a new block only when the results render differently from its last one.
+
+A custom `query` callback receives the whole conversation, including text injected on
+earlier turns, so skip blocks with `metadata.injected` if the query should use only the
+user's words.
+</Tab>
+</Tabs>
 
 Customize retrieval, timing, and formatting with a config object:
 
