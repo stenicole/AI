@@ -248,8 +248,8 @@ export class VercelModel extends Model<VercelModelConfig> {
  * {@link VercelModelConfig.cacheConfig} for the per-provider routing.
  *
  * @param modelInfo - What the SDK knows about the wrapped model; decides the default `'auto'` strategy
- * @param dynamicTrailingBlocks - Trailing content parts of the last user message a context injector
- * rebuilds every call; the conversation breakpoint stays ahead of them so the cached prefix is stable.
+ * @param dynamicTrailingBlocks - Trailing content parts of the last user message that change on every
+ * call; the conversation breakpoint stays ahead of them so the cached prefix is stable.
  * @internal
  */
 function applyVercelCacheConfig(
@@ -450,8 +450,8 @@ function blocksCachePoint(part: LanguageModelV3TextPart | LanguageModelV3FilePar
  * Finds the content part the conversation breakpoint should sit on: the last part at or before the
  * durable boundary that the provider accepts a breakpoint after.
  *
- * `dynamicTrailingBlocks` counts trailing parts a context injector rebuilds every call (e.g. a
- * per-turn timestamp); the breakpoint must stay ahead of them, or the cached prefix changes every
+ * `dynamicTrailingBlocks` counts trailing parts that change on every call (e.g. the token status that
+ * agentic context management adds); the breakpoint must stay ahead of them, or the cached prefix changes every
  * turn and is written but never read. `accepts` rejects part types the provider cannot carry a
  * breakpoint after. Returns undefined when nothing durable remains, so the caller skips the point.
  *

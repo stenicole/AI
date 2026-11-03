@@ -12,7 +12,8 @@ import type { InjectionOptions, InjectionTrigger, InjectionContext } from './typ
  * call, as a {@link TextBlock} marked with `metadata.injected`, and leaves it there.
  *
  * The write happens in a `BeforeModelCallEvent` hook that runs after the SDK's other hooks, so it reaches
- * that model call and lands in any user message those hooks added. It only ever touches the latest message
+ * that model call and lands in any user message those hooks added. Continuation input is appended after the
+ * hooks run, so it lands after the injected text, or is sent without it. It only ever touches the latest message
  * while it is a user message, which the model has not answered yet. Every later request therefore starts
  * with the earlier one unchanged.
  *

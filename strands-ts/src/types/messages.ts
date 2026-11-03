@@ -242,6 +242,9 @@ export interface TextBlockData {
 
 /**
  * Text content block within a message.
+ *
+ * `ContextInjector` and `MemoryManager` add text blocks to user messages and mark them with
+ * `metadata.injected`, so code that should only see the user's own words can skip them.
  */
 export class TextBlock implements TextBlockData, JSONSerializable<TextBlockData> {
   /**
